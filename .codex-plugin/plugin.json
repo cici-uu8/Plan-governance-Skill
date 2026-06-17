@@ -29,6 +29,13 @@
     ],
     "websiteURL": "https://github.com/cici-uu8/Plan-governance-Skill",
     "brandColor": "#0F766E",
+    "composerIcon": "./assets/logo.png",
+    "logo": "./assets/logo.png",
+    "screenshots": [
+      "./assets/screenshot-adoption-report.png",
+      "./assets/screenshot-registry.png",
+      "./assets/screenshot-timeline.png"
+    ],
     "defaultPrompt": [
       "用 $plan-governance 接入分析这个仓库。",
       "用 $plan-governance 启用计划治理。"
