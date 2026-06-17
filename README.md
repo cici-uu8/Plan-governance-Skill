@@ -30,7 +30,9 @@ Claude wrote a new production plan. Codex later entered the same project, did no
 
 That failure mode is common in real repositories: plans are created by different agents, old documents stay around, and the project depends on chat history to remember what is current.
 
-`plan-governance` turns that implicit memory into repo-visible state. It does not write your product roadmap for you. It governs the lifecycle of plan documents: adoption analysis, registry, replacement links, closeout, and ongoing maintenance after enablement.
+After governance is enabled, the registry makes the current plan explicit. The next agent can read `docs/plan_registry.md`, see which plan is active, follow supersession links, and avoid treating stale planning docs as the source of truth.
+
+`plan-governance` turns implicit memory into repo-visible state. It does not write your product roadmap for you. It governs the lifecycle of plan documents: adoption analysis, registry, replacement links, closeout, and ongoing maintenance after enablement.
 
 ## What It Solves
 
@@ -44,22 +46,35 @@ That failure mode is common in real repositories: plans are created by different
 
 ## 30-Second Start
 
-### Install
+### Option 1: install with `npx skills` (recommended)
 
-In Codex, install from this GitHub repo with `$skill-installer`:
+[`skills`](https://github.com/vercel-labs/skills) is an open-source Agent Skill package manager. It can detect supported agent environments and install the skill in the right place.
+
+```bash
+npx skills add cici-uu8/Plan-governance-Skill --skill plan-governance
+```
+
+### Option 2: ask Codex to install it
+
+In Codex, say:
 
 ```text
-Use $skill-installer to install cici-uu8/Plan-governance-Skill from GitHub.
+Use $skill-installer to install this skill from https://github.com/cici-uu8/Plan-governance-Skill
 ```
 
 Restart Codex if the new skill does not appear immediately.
 
-### Use
+### First run
 
-After installation, use only these two entry phrases:
+After installation, start with the read-only adoption scan:
 
 ```text
 Use $plan-governance to analyze adoption for this repo.
+```
+
+You now have an adoption report. Enable governance only if you agree with the scan:
+
+```text
 Use $plan-governance to enable plan governance.
 ```
 
@@ -68,22 +83,45 @@ Use $plan-governance to enable plan governance.
 | `Use $plan-governance to analyze adoption for this repo.` | Read-only scan. It writes an adoption report, but does not create a registry or modify `AGENTS.md`. |
 | `Use $plan-governance to enable plan governance.` | Creates governance files and installs the managed `AGENTS.md` block unless you explicitly refuse. |
 
-## What Happens After Enablement
+## How It Works After Enablement
 
 Once `docs/plan_registry.md` exists, the repo is considered governed.
 
-| Event | Default behavior |
-|---|---|
-| A new plan document appears | Register it or refresh governance state |
-| A new plan replaces an older one | Add supersession links and mark the old plan superseded |
-| A plan ends without replacement | Close it instead of editing historical text |
-| Governance state changes | Refresh timeline output and run lint |
-| Multiple docs could be current | Ask before deciding |
-| A document could be either replacement or parallel workstream | Ask before linking it |
+You do not need to say "register this plan" or "close that plan" for routine cases. When a new plan document is created, the skill should register it or refresh governance state. When a new plan replaces an old one, it should link the two plans and mark the old one superseded. When a plan ends without replacement, it should close the plan instead of rewriting history.
+
+The skill should ask before making ambiguous decisions:
+
+- multiple documents could be the current plan
+- a new document could be either a replacement or a parallel workstream
+- a folder or document type may need to be excluded from governance
 
 The intended UX is not "make the user run eight commands." The intended UX is: the user opts in, then agents maintain the plan lifecycle as part of normal project work.
 
+## Typical Workflow
+
+After governance is enabled, project work can stay natural:
+
+```text
+Create a new execution plan for the retrieval evaluation workstream.
+```
+
+The agent creates the plan document and registers it.
+
+```text
+This new plan replaces the old Week 2 retrieval plan.
+```
+
+The agent links the new plan to the old one with `supersedes` / `superseded_by`.
+
+```text
+Review the current plan governance state before continuing.
+```
+
+The agent reads the registry and timeline report before choosing the next source of truth.
+
 ## Real Output
+
+The screenshots below use a small synthetic brownfield repo. They are intentionally simple so the output shape is easy to inspect. Real adoption reports may contain more high-confidence plans, quarantine candidates, and ignored paths.
 
 ### Read-only adoption report
 
@@ -157,8 +195,6 @@ plan-governance/
 `README.md` is the public project entry. `SKILL.md` is the agent execution guide. The nested `skills/plan-governance/SKILL.md` is the plugin distribution wrapper.
 
 ## Star History
-
-This repository is new. The chart below will become meaningful after the project has public usage.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=cici-uu8/Plan-governance-Skill&type=Date&theme=dark" />
