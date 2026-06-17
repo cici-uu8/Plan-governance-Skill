@@ -121,7 +121,7 @@ agent 读取 registry 和 timeline report，再决定当前事实来源。
 
 ## 真实产物
 
-下面截图使用的是一个小型合成 brownfield 仓库。它们故意保持简单，方便读者看清输出形态。真实项目的 adoption report 可能包含更多高置信度计划、quarantine 候选和 ignored paths。
+下面展示的是一组简化示例，用来帮助你快速理解产物长什么样。
 
 ### 只读接入分析报告
 
