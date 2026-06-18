@@ -93,9 +93,9 @@ PlanGraph 当前先聚焦确定性基础：
 - 当前主线分离
 - 主动 register / refresh / close / supersede 维护
 - registry 和生命周期一致性 lint
-- mainline、lineage、impact、确定性 conflicts 和显式 Markdown 正文链接的内存图谱查询
+- mainline、lineage、impact、确定性 conflicts、显式 Markdown 正文链接和 repo 外部引用的内存图谱查询
 
-SQLite 索引、MCP server 和语义边是后续阶段，不是当前本地 skill 工作流的前置条件。正文链接抽取已经作为只读 graph query 提供，但在驱动更重索引设计前仍需要更多真实仓库验证。
+SQLite 索引、MCP server 和语义边是后续阶段，不是当前本地 skill 工作流的前置条件。正文链接抽取已经作为只读 graph query 提供。真实仓库验证已经说明：repo 外链接应该先被分类为 external references，而不是急着进入 SQLite。
 
 ## 启用后如何工作
 
@@ -133,6 +133,8 @@ agent 建立 `supersedes` / `superseded_by` 关系。
 ```
 
 agent 查询 PlanGraph，再决定当前事实来源。
+
+如果计划链接到另一个本地 checkout 或 worktree 里的文档，PlanGraph 会把它报告为 `external_reference`，并显示目标路径、文件是否存在、是否命中 configured trusted roots。外部引用默认只是上下文，不会变成当前 repo 的图谱边，也不会变成 registry 事实。
 
 ## 真实产物
 

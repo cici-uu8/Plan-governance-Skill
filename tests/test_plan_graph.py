@@ -287,6 +287,77 @@ class PlanGraphTests(unittest.TestCase):
             self.assertEqual(result['edges'][0]['source'], 'a')
             self.assertEqual(result['edges'][0]['target'], 'b')
 
+    def test_body_links_classifies_external_references_with_trust_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = workspace / 'repo'
+            external = workspace / 'other-worktree'
+            docs = root / 'docs'
+            external_docs = external / 'docs'
+            docs.mkdir(parents=True)
+            external_docs.mkdir(parents=True)
+            (external / '.git').mkdir()
+            external_doc = external_docs / 'external.md'
+            external_doc.write_text('# External\n', encoding='utf-8')
+            rows = [
+                ['source', 'Source', 'docs/source.md', 'execution_plan', 'core', 'active', 'in_progress', 'true', 'manual', '1.00', '', '', '', '', '', ''],
+            ]
+            (docs / 'source.md').write_text(f'# Source\n\nSee [external]({external_doc}).\n', encoding='utf-8')
+
+            untrusted = plan_governance.PlanGraph(
+                plan_governance.parse_registry_rows(registry_text(rows)),
+                {},
+                repo_root=root,
+            ).body_links('source')
+            untrusted_ref = untrusted['external_references'][0]
+            self.assertEqual(untrusted['external_reference_count'], 1)
+            self.assertEqual(untrusted['unresolved_count'], 0)
+            self.assertFalse(untrusted_ref['trusted'])
+            self.assertEqual(untrusted_ref['trusted_root'], '')
+            self.assertEqual(untrusted_ref['external_worktree'], str(external.resolve()))
+            self.assertTrue(untrusted_ref['exists'])
+
+            trusted = plan_governance.PlanGraph(
+                plan_governance.parse_registry_rows(registry_text(rows)),
+                {'external_reference_roots': [str(external)]},
+                repo_root=root,
+            ).body_links('source')
+            external_ref = trusted['external_references'][0]
+
+            self.assertEqual(trusted['external_reference_count'], 1)
+            self.assertEqual(trusted['unresolved_count'], 0)
+            self.assertEqual(external_ref['kind'], 'external_reference')
+            self.assertTrue(external_ref['trusted'])
+            self.assertEqual(external_ref['trusted_root'], str(external.resolve()))
+            self.assertEqual(external_ref['external_worktree'], str(external.resolve()))
+            self.assertTrue(external_ref['exists'])
+
+    def test_body_links_reports_missing_external_reference_existence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = workspace / 'repo'
+            external = workspace / 'other-worktree'
+            docs = root / 'docs'
+            docs.mkdir(parents=True)
+            external.mkdir()
+            missing_external_doc = external / 'docs' / 'missing.md'
+            rows = [
+                ['source', 'Source', 'docs/source.md', 'execution_plan', 'core', 'active', 'in_progress', 'true', 'manual', '1.00', '', '', '', '', '', ''],
+            ]
+            (docs / 'source.md').write_text(f'# Source\n\nSee [missing external]({missing_external_doc}).\n', encoding='utf-8')
+
+            result = plan_governance.PlanGraph(
+                plan_governance.parse_registry_rows(registry_text(rows)),
+                {'external_reference_roots': [str(external)]},
+                repo_root=root,
+            ).body_links('source')
+            external_ref = result['external_references'][0]
+
+            self.assertEqual(result['external_reference_count'], 1)
+            self.assertEqual(result['unresolved_count'], 0)
+            self.assertTrue(external_ref['trusted'])
+            self.assertFalse(external_ref['exists'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -180,6 +180,49 @@ class GovernanceCommandTests(unittest.TestCase):
             self.assertIn('unresolved body link', lint.stdout)
             self.assertIn('reason=missing-file', lint.stdout)
 
+    def test_lint_allows_trusted_existing_external_references(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = workspace / 'repo'
+            external = workspace / 'other-worktree'
+            docs = root / 'docs'
+            external_docs = external / 'docs'
+            docs.mkdir(parents=True)
+            external_docs.mkdir(parents=True)
+            write_minimal_repo_config(root)
+            with (root / '.plangraph.yml').open('a', encoding='utf-8') as fh:
+                fh.write('external_reference_roots:\n')
+                fh.write(f'  - {external}\n')
+            external_doc = external_docs / 'external.md'
+            external_doc.write_text('# External\n', encoding='utf-8')
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'week1_plan.md').write_text(f'# Week 1 Plan\n\nSee [external]({external_doc}).\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/week1_plan.md')
+
+            lint = run_cli(root, 'lint')
+
+            self.assertIn('plangraph lint: ok', lint.stdout)
+
+    def test_lint_allows_untrusted_external_references_as_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = workspace / 'repo'
+            external = workspace / 'other-worktree'
+            docs = root / 'docs'
+            external_docs = external / 'docs'
+            docs.mkdir(parents=True)
+            external_docs.mkdir(parents=True)
+            write_minimal_repo_config(root)
+            external_doc = external_docs / 'external.md'
+            external_doc.write_text('# External\n', encoding='utf-8')
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'week1_plan.md').write_text(f'# Week 1 Plan\n\nSee [external]({external_doc}).\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/week1_plan.md')
+
+            lint = run_cli(root, 'lint')
+
+            self.assertIn('plangraph lint: ok', lint.stdout)
+
 
 if __name__ == '__main__':
     unittest.main()

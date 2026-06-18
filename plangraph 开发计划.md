@@ -552,11 +552,14 @@ Stop / Go：
 - `graph body-links [plan_id]` 是只读派生查询，不修改 registry。
 - `lint` 会报告 unresolved body links，但不会把候选边自动写入 registry。
 - 已有单元测试覆盖 resolved edge、missing file、unregistered target、missing anchor 和全仓扫描。
-- 仍需要在真实仓库上统计链接密度和误报率，再决定是否进入 SQLite 或更重的索引设计。
+- 真实 oncall 仓库 Stop/Go 验证结果：`edge_count=1`、`unresolved_count=8`、`unresolved_ratio=88.89%`，8 条 unresolved 全部是 `outside-repo`。结论是 Stop：暂停进入 SQLite，不把稀疏且跨 worktree 的链接数据放进重索引。
+- 当前小步增强：把 repo 外本地绝对路径结构化为 `external_reference`，显示目标外部目录、文件是否存在、是否命中 `external_reference_roots`。默认不纳入当前项目图谱；trusted roots 只表示“可信外部上下文”，不表示“当前 repo 的执行依赖”。
+- 二次真实验证结果：默认配置下得到 `edge_count=1`、`external_reference_count=8`、`external_existing_count=8`、`unresolved_count=0`；在内存配置中加入 `/Users/cici/oncall agent/super_biz_agent_py-release-2026-03-21` 后，8 条外部引用全部标为 `trusted=true`。结论仍是 Stop SQLite：external refs 让上下文更清楚，但当前还不能证明它们是稳定的当前执行依赖。
 
 Stop / Go：
 
 - 如果正文链接密度很低、错误率很高，暂停扩边，不进入更重的索引设计。
+- 如果启用 trusted external refs 后仍无法回答“这些引用是历史参考还是当前执行依赖”，也暂停 SQLite。SQLite 只能加速稳定关系，不能替稀疏或歧义数据做决策。
 
 ### Phase 5：SQLite 索引（`v0.4`）
 

@@ -212,7 +212,7 @@ Graph query output is JSON. It is intended for agent consumption, not prose scra
 
 `graph conflicts` reports deterministic hard conflicts from registry state only. It does not report semantic or embedding-inferred conflicts.
 
-`graph body-links` extracts explicit Markdown links from registered document bodies. It reports `body-link` edges and unresolved references, but it does not write inferred relationships back to the registry.
+`graph body-links` extracts explicit Markdown links from registered document bodies. It reports repo-local `body-link` edges, outside-repo `external_reference` items, and unresolved references, but it does not write inferred relationships back to the registry. External references include existence and trust metadata. They stay outside the current repo graph unless a future workflow explicitly adopts them; `external_reference_roots` only marks configured local roots as trusted context.
 
 ### 4. Lint PlanGraph state
 
@@ -233,6 +233,8 @@ This checks for:
 - broken or asymmetric `supersedes` / `superseded_by` links
 - graph-level issues such as supersession cycles and orphan parents
 - unresolved Markdown body links from registered plan documents
+
+Outside-repo local Markdown links are reported as `external_reference` context instead of failing lint by default. Missing repo-local links still fail lint because they point at broken or unregistered documents inside the governed repo.
 
 ### 5. Close or supersede a plan
 

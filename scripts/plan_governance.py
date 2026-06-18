@@ -713,6 +713,44 @@ def is_external_link(target: str) -> bool:
     return bool(re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*:', target)) or target.startswith('#')
 
 
+def trusted_external_roots(cfg: dict[str, Any]) -> list[Path]:
+    roots: list[Path] = []
+    for raw_root in cfg.get('external_reference_roots') or []:
+        raw_text = str(raw_root).strip()
+        if raw_text:
+            roots.append(Path(raw_text).expanduser().resolve())
+    return roots
+
+
+def containing_trusted_root(path: Path, roots: list[Path]) -> Path | None:
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return root
+        except ValueError:
+            continue
+    return None
+
+
+def nearest_git_root(path: Path) -> Path | None:
+    current = path if path.is_dir() else path.parent
+    for candidate in [current, *current.parents]:
+        if (candidate / '.git').exists():
+            return candidate
+    return None
+
+
+def external_reference_info(path: Path, roots: list[Path]) -> dict[str, Any]:
+    trusted_root = containing_trusted_root(path, roots)
+    external_worktree = trusted_root or nearest_git_root(path) or path.parent
+    return {
+        'trusted': trusted_root is not None,
+        'trusted_root': str(trusted_root) if trusted_root is not None else '',
+        'external_worktree': str(external_worktree),
+        'exists': path.exists(),
+    }
+
+
 def load_registry_layout(repo_root: Path, cfg: dict[str, Any]) -> tuple[list[str], list[dict[str, str]]]:
     registry_path = repo_root / cfg.get('registry_path', 'docs/plan_registry.md')
     if registry_path.exists():
@@ -1288,6 +1326,8 @@ class PlanGraph:
 
         edges: list[dict[str, Any]] = []
         unresolved: list[dict[str, Any]] = []
+        external_references: list[dict[str, Any]] = []
+        external_roots = trusted_external_roots(self.cfg)
         for row in selected_rows:
             doc_rel_path = row.get('doc_path', '')
             doc_path = self.repo_root / doc_rel_path
@@ -1313,7 +1353,17 @@ class PlanGraph:
                 try:
                     rel_target = resolved.relative_to(self.repo_root).as_posix()
                 except ValueError:
-                    unresolved.append(self._body_link_unresolved(row, raw_target, link, 'outside-repo'))
+                    external_references.append({
+                        'source': row.get('plan_id', ''),
+                        'source_doc_path': doc_rel_path,
+                        'target': raw_target,
+                        'target_path': str(resolved),
+                        'kind': 'external_reference',
+                        'label': link['label'],
+                        'line': link['line'],
+                        'provenance': 'body-link',
+                        **external_reference_info(resolved, external_roots),
+                    })
                     continue
                 if not resolved.exists():
                     unresolved.append(self._body_link_unresolved(row, raw_target, link, 'missing-file', target_doc_path=rel_target))
@@ -1343,8 +1393,10 @@ class PlanGraph:
             'query': 'body-links',
             'plan': row_summary(selected_plan) if selected_plan else {},
             'edges': edges,
+            'external_references': external_references,
             'unresolved': unresolved,
             'edge_count': len(edges),
+            'external_reference_count': len(external_references),
             'unresolved_count': len(unresolved),
             'provenance': 'body-link',
         }

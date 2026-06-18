@@ -93,9 +93,9 @@ PlanGraph currently focuses on the deterministic foundation:
 - current mainline separation
 - proactive register / refresh / close / supersede maintenance
 - lint rules for registry and lifecycle consistency
-- in-memory graph queries for mainline, lineage, impact, deterministic conflicts, and explicit Markdown body links
+- in-memory graph queries for mainline, lineage, impact, deterministic conflicts, explicit Markdown body links, and outside-repo external references
 
-SQLite indexing, MCP server support, and semantic edges are planned phases, not required for the current local-first skill workflow. Body-link extraction is available as a read-only graph query and still needs broader real-repo validation before it drives heavier indexing work.
+SQLite indexing, MCP server support, and semantic edges are planned phases, not required for the current local-first skill workflow. Body-link extraction is available as a read-only graph query. Real-repo validation has shown that outside-repo links should first be classified as external references, not rushed into SQLite.
 
 ## How It Works After Enablement
 
@@ -133,6 +133,8 @@ Before changing the current plan, check its lineage, impact, and body links.
 ```
 
 The agent queries PlanGraph before choosing the source of truth.
+
+If a plan links to a document in another local checkout or worktree, PlanGraph reports it as an `external_reference` with the target path, whether the file exists, and whether it matches configured trusted roots. External references are context by default; they do not become current-repo graph edges or registry facts.
 
 ## Real Output
 

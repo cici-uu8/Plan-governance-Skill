@@ -15,6 +15,7 @@ mainline_mode: auto
 execution_policy: auto
 update_mode: hybrid
 install_agents_block: true
+external_reference_roots: []
 frontmatter:
   managed_keys:
     - plan_id
@@ -114,5 +115,6 @@ Notes:
 - `execution_policy` may be set explicitly to values such as `strict_mainline` or `parallel_workstreams`. The default `auto` lets the skill infer whether the repo currently behaves like one mainline or several parallel workstreams.
 - `update_mode=hybrid` is the recommended default. It preserves existing registry rows and appends newly discovered high-confidence docs.
 - `install_agents_block=true` is the recommended default when a repo explicitly enables PlanGraph. Set it to `false` only when the project wants registry files without managed `AGENTS.md` enforcement.
+- `external_reference_roots` defaults to an empty list. Absolute local links outside the repo are reported as `external_reference` context and do not enter the current repo graph. When an external link is under one of these roots, PlanGraph marks it `trusted: true`; otherwise it remains untrusted context.
 - Repos may extend enums, but the registry and lint rules must agree with the configured enum set.
 - `classification.transcript_patterns` should describe file names or paths, not arbitrary body text, to avoid quarantining plan docs that merely mention chat logs.

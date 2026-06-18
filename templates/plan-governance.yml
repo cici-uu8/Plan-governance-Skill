@@ -8,6 +8,7 @@ mainline_mode: auto
 execution_policy: auto
 update_mode: hybrid
 install_agents_block: true
+external_reference_roots: []
 frontmatter:
   managed_keys:
     - plan_id
