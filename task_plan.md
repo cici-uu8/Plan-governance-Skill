@@ -18,7 +18,8 @@ Move the repository public surface into a standalone `plangraph` product context
 | 8. Add deterministic graph conflicts | complete | `graph conflicts` reports registry-derived hard conflicts and lint reuses the same conflict engine |
 | 9. Add CI lint template and PyYAML fallback tests | complete | GitHub Actions lint sample exists; config/frontmatter reads fall back without PyYAML |
 | 10. Add read-only body-link graph extraction | complete | `graph body-links [plan_id]` returns `body-link` edges, external references, and unresolved refs without registry writes |
-| 11. Record Phase 4 Stop/Go and classify external references | in progress | real validation stopped SQLite; outside-repo links are being reported as structured `external_reference` context |
+| 11. Record Phase 4 Stop/Go and classify external references | complete | real validation stopped SQLite; outside-repo links are structured `external_reference` context |
+| 12. Add external-reference adoption workflow | in progress | dry-run/apply command localizes useful external Markdown refs before any SQLite work |
 
 ## Acceptance Criteria
 
@@ -39,5 +40,5 @@ Move the repository public surface into a standalone `plangraph` product context
 
 - SQLite index and `.plangraph/` persisted graph storage are not implemented.
 - MCP server and host install/uninstall commands are not implemented.
-- Markdown body-link extraction has a read-only v0.3 query implementation. Real-repo Stop/Go paused SQLite because repo-local edges were sparse and outside-repo links dominated; the current stabilization step classifies those outside-repo links as external references.
+- Markdown body-link extraction has a read-only v0.3 query implementation. Real-repo Stop/Go paused SQLite because repo-local edges were sparse and outside-repo links dominated; the current stabilization step classifies and can optionally localize useful outside-repo Markdown references.
 - Semantic edges and embedding-backed conflict detection are not implemented.

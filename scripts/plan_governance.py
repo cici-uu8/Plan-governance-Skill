@@ -27,6 +27,7 @@ DEFAULT_TIMELINE_TEMPLATE = Path.home() / '.codex/skills/plan-governance/templat
 DEFAULT_QUARANTINE_TEMPLATE = Path.home() / '.codex/skills/plan-governance/templates/plan-quarantine.md'
 DEFAULT_AGENTS_SNIPPET = Path.home() / '.codex/skills/plan-governance/templates/AGENTS-plan-governance-snippet.md'
 DEFAULT_ADOPTION_REPORT_PATH = 'docs/plan_adoption_report.md'
+DEFAULT_EXTERNAL_IMPORT_DIR = 'docs/references/external'
 CONFIG_PATH = '.plangraph.yml'
 IGNORE_PATH = '.plangraph.ignore'
 LEGACY_CONFIG_PATH = '.plan-governance.yml'
@@ -749,6 +750,82 @@ def external_reference_info(path: Path, roots: list[Path]) -> dict[str, Any]:
         'external_worktree': str(external_worktree),
         'exists': path.exists(),
     }
+
+
+def safe_import_filename(path: Path) -> str:
+    stem = re.sub(r'[^A-Za-z0-9._\-\u4e00-\u9fff]+', '_', path.stem).strip('._-') or 'external'
+    suffix = path.suffix if path.suffix.lower() == '.md' else '.md'
+    digest = hashlib.sha1(str(path).encode('utf-8')).hexdigest()[:8]
+    return f'{stem}_{digest}{suffix}'
+
+
+def external_import_rel_path(cfg: dict[str, Any], source_path: Path) -> str:
+    import_dir = str(cfg.get('external_reference_import_dir') or DEFAULT_EXTERNAL_IMPORT_DIR).strip().strip('/')
+    if not import_dir:
+        import_dir = DEFAULT_EXTERNAL_IMPORT_DIR
+    return f'{import_dir}/{safe_import_filename(source_path)}'.replace('\\', '/')
+
+
+def relative_markdown_link(from_doc: Path, to_doc: Path) -> str:
+    rel = os.path.relpath(to_doc, start=from_doc.parent)
+    return rel.replace('\\', '/')
+
+
+def rewrite_markdown_link_target(text: str, old_target: str, new_target: str) -> tuple[str, int]:
+    count = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal count
+        target = strip_markdown_link_target(match.group(2))
+        if target != old_target:
+            return match.group(0)
+        count += 1
+        return f'[{match.group(1)}]({new_target})'
+
+    return MARKDOWN_LINK_RE.sub(replace, text), count
+
+
+def classify_external_reference_candidate(path: Path, rel_path: str, cfg: dict[str, Any]) -> Candidate:
+    candidate = Candidate(path=path, rel_path=rel_path, title=path.stem)
+    classified = classify_candidate(candidate, cfg)
+    if classified.doc_role == 'unknown':
+        classified.doc_role = 'reference_doc'
+    classified.confidence = max(classified.confidence, 0.65)
+    classified.reasons.append('imported from external_reference')
+    return classified
+
+
+def external_adoption_category(candidate: Candidate, cfg: dict[str, Any]) -> str:
+    transcript_patterns = cfg.get('classification', {}).get('transcript_patterns', TRANSCRIPT_PATTERNS)
+    if looks_like_transcript(candidate.rel_path, transcript_patterns):
+        return 'noise'
+    if candidate.doc_role in {'master_plan', 'execution_plan', 'workstream_plan'}:
+        return 'historical_plan'
+    if candidate.doc_role == 'decision_doc':
+        return 'decision'
+    if candidate.doc_role == 'evidence_doc':
+        return 'evidence'
+    return 'implementation_note'
+
+
+def imported_external_row(candidate: Candidate, today: str, cfg: dict[str, Any], source_path: str) -> dict[str, str]:
+    adoption_category = external_adoption_category(candidate, cfg)
+    if candidate.doc_role in {'execution_plan', 'workstream_plan', 'master_plan', 'unknown'}:
+        candidate.doc_role = 'reference_doc'
+    row = registry_row_from_candidate(candidate, 'external_import', today, cfg=cfg)
+    if row['doc_role'] == 'closeout_doc':
+        row['lifecycle_status'] = 'closed'
+        row['execution_status'] = 'completed'
+    elif row['doc_role'] in {'decision_doc', 'evidence_doc', 'reference_doc'}:
+        row['lifecycle_status'] = 'closed'
+        row['execution_status'] = 'n_a'
+    else:
+        row['doc_role'] = 'reference_doc'
+        row['lifecycle_status'] = 'closed'
+        row['execution_status'] = 'n_a'
+    row['authoritative'] = 'false'
+    row['notes'] = f'imported external reference ({adoption_category}) from {source_path}'
+    return row
 
 
 def load_registry_layout(repo_root: Path, cfg: dict[str, Any]) -> tuple[list[str], list[dict[str, str]]]:
@@ -2007,6 +2084,131 @@ def validate_status_value(cfg: dict[str, Any], enum_name: str, value: str) -> bo
     return not allowed or value in allowed
 
 
+def external_reference_adoption_plan(repo_root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    graph = load_graph(repo_root, cfg)
+    if graph is None:
+        return {'error': 'registry missing', 'query': 'adopt-external-references'}
+    result = graph.body_links()
+    if 'error' in result:
+        return {'error': result['error'], 'query': 'adopt-external-references'}
+
+    rows = load_registry_rows_for_update(repo_root, cfg) or []
+    registered_paths = {row.get('doc_path', '') for row in rows}
+    seen_targets: set[str] = set()
+    candidates: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for ref in result.get('external_references', []):
+        target_path = Path(str(ref.get('target_path', '')))
+        if str(target_path) in seen_targets:
+            continue
+        seen_targets.add(str(target_path))
+        if not ref.get('exists'):
+            skipped.append({**ref, 'reason': 'external-file-missing'})
+            continue
+        if target_path.suffix.lower() != '.md':
+            skipped.append({**ref, 'reason': 'not-markdown'})
+            continue
+        dest_rel = external_import_rel_path(cfg, target_path)
+        if dest_rel in registered_paths:
+            skipped.append({**ref, 'reason': 'already-registered', 'destination_doc_path': dest_rel})
+            continue
+        dest_path = repo_root / dest_rel
+        classified = classify_external_reference_candidate(target_path, dest_rel, cfg)
+        adoption_category = external_adoption_category(classified, cfg)
+        if adoption_category == 'noise':
+            skipped.append({**ref, 'reason': 'noise', 'destination_doc_path': dest_rel})
+            continue
+        preview_row = imported_external_row(classified, date.today().isoformat(), cfg, str(target_path))
+        candidates.append({
+            **ref,
+            'destination_doc_path': dest_rel,
+            'destination_path': str(dest_path),
+            'adoption_category': adoption_category,
+            'suggested_role': preview_row['doc_role'],
+            'suggested_lifecycle_status': preview_row['lifecycle_status'],
+            'suggested_execution_status': preview_row['execution_status'],
+            'suggested_action': 'copy-register-rewrite-link',
+            'classification_confidence': f'{classified.confidence:.2f}',
+            'classification_reasons': classified.reasons,
+        })
+    return {
+        'query': 'adopt-external-references',
+        'apply': False,
+        'candidates': candidates,
+        'skipped': skipped,
+        'candidate_count': len(candidates),
+        'skipped_count': len(skipped),
+        'notes': [
+            'Dry run only. Re-run with --apply to copy, rewrite links, register imported docs, and refresh timeline.',
+            'Imported external references are non-authoritative governed context by default, not current mainline work.',
+        ],
+    }
+
+
+def run_adopt_external_references(repo_root: Path, cfg: dict[str, Any], apply: bool = False) -> int:
+    plan = external_reference_adoption_plan(repo_root, cfg)
+    if 'error' in plan:
+        print(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))
+        return 1
+    if not apply:
+        print(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    rows = load_registry_rows_for_update(repo_root, cfg)
+    if rows is None:
+        return 1
+    today = date.today().isoformat()
+    imported: list[dict[str, Any]] = []
+    rewritten_sources: set[str] = set()
+    for item in plan.get('candidates', []):
+        source_external = Path(item['target_path'])
+        dest_rel = item['destination_doc_path']
+        dest_path = repo_root / dest_rel
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        if not dest_path.exists():
+            shutil.copyfile(source_external, dest_path)
+
+        classified = classify_external_reference_candidate(source_external, dest_rel, cfg)
+        row = imported_external_row(classified, today, cfg, str(source_external))
+        rows.append(row)
+
+        source_doc_rel = item.get('source_doc_path', '')
+        source_doc = repo_root / source_doc_rel
+        if source_doc.exists():
+            old_text = source_doc.read_text(encoding='utf-8', errors='ignore')
+            new_target = relative_markdown_link(source_doc, dest_path)
+            new_text, replaced = rewrite_markdown_link_target(old_text, item.get('target', ''), new_target)
+            if replaced:
+                source_doc.write_text(new_text, encoding='utf-8')
+                rewritten_sources.add(source_doc_rel)
+
+        imported.append({
+            'source_path': str(source_external),
+            'destination_doc_path': dest_rel,
+            'plan_id': row['plan_id'],
+            'doc_role': row['doc_role'],
+            'lifecycle_status': row['lifecycle_status'],
+        })
+
+    rows = dedupe_registry_rows(rows)
+    apply_revision_chain(rows)
+    mark_current_mainline_notes(rows, cfg)
+    write_registry_rows(repo_root, cfg, rows)
+    write_timeline(repo_root, cfg)
+    result = {
+        'query': 'adopt-external-references',
+        'apply': True,
+        'imported': imported,
+        'imported_count': len(imported),
+        'rewritten_sources': sorted(rewritten_sources),
+        'rewritten_source_count': len(rewritten_sources),
+        'skipped': plan.get('skipped', []),
+        'skipped_count': plan.get('skipped_count', 0),
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def run_register(repo_root: Path, cfg: dict[str, Any], raw_path: str) -> int:
     registry_path = repo_root / cfg.get('registry_path', 'docs/plan_registry.md')
     if not registry_path.exists():
@@ -2222,13 +2424,14 @@ def run_refresh(repo_root: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['init', 'bootstrap', 'refresh', 'register', 'graph', 'lint', 'report', 'install-agents-block', 'remove-agents-block', 'close', 'supersede'])
+    parser.add_argument('command', choices=['init', 'bootstrap', 'refresh', 'register', 'graph', 'lint', 'report', 'adopt-external-references', 'install-agents-block', 'remove-agents-block', 'close', 'supersede'])
     parser.add_argument('ids', nargs='*')
     parser.add_argument('--repo-root', default=os.getcwd())
     parser.add_argument('--lifecycle-status', default='closed')
     parser.add_argument('--execution-status')
     parser.add_argument('--workstream')
     parser.add_argument('--skip-install-agents-block', action='store_true')
+    parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     repo_root = Path(args.repo_root).resolve()
 
@@ -2260,6 +2463,8 @@ def main() -> int:
         return 0
     if args.command == 'lint':
         return lint(repo_root, cfg)
+    if args.command == 'adopt-external-references':
+        return run_adopt_external_references(repo_root, cfg, apply=args.apply)
     if args.command == 'install-agents-block':
         install_agents_block(repo_root)
         return 0

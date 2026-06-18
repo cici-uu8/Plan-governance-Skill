@@ -223,6 +223,73 @@ class GovernanceCommandTests(unittest.TestCase):
 
             self.assertIn('plangraph lint: ok', lint.stdout)
 
+    def test_adopt_external_references_dry_run_does_not_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = workspace / 'repo'
+            external = workspace / 'other-worktree'
+            docs = root / 'docs'
+            external_docs = external / 'docs'
+            docs.mkdir(parents=True)
+            external_docs.mkdir(parents=True)
+            write_minimal_repo_config(root)
+            external_doc = external_docs / 'decision.md'
+            external_doc.write_text('# External Decision\n', encoding='utf-8')
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'week1_plan.md').write_text(f'# Week 1 Plan\n\nSee [decision]({external_doc}).\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/week1_plan.md')
+
+            result = run_cli(root, 'adopt-external-references')
+            data = json.loads(result.stdout)
+
+            self.assertFalse(data['apply'])
+            self.assertEqual(data['candidate_count'], 1)
+            self.assertEqual(data['candidates'][0]['adoption_category'], 'implementation_note')
+            self.assertEqual(data['candidates'][0]['suggested_role'], 'reference_doc')
+            self.assertEqual(data['candidates'][0]['suggested_lifecycle_status'], 'closed')
+            self.assertFalse((root / data['candidates'][0]['destination_doc_path']).exists())
+            self.assertNotIn('decision_', (docs / 'week1_plan.md').read_text(encoding='utf-8'))
+
+    def test_adopt_external_references_apply_imports_rewrites_and_registers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = workspace / 'repo'
+            external = workspace / 'other-worktree'
+            docs = root / 'docs'
+            external_docs = external / 'docs'
+            docs.mkdir(parents=True)
+            external_docs.mkdir(parents=True)
+            write_minimal_repo_config(root)
+            external_doc = external_docs / 'decision.md'
+            external_doc.write_text('# External Decision\n', encoding='utf-8')
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'week1_plan.md').write_text(f'# Week 1 Plan\n\nSee [decision]({external_doc}).\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/week1_plan.md')
+
+            result = run_cli(root, 'adopt-external-references', '--apply')
+            data = json.loads(result.stdout)
+            imported_rel = data['imported'][0]['destination_doc_path']
+            imported_path = root / imported_rel
+            source_text = (docs / 'week1_plan.md').read_text(encoding='utf-8')
+            rows = registry_rows(root)
+            imported_rows = [row for row in rows.values() if row['doc_path'] == imported_rel]
+
+            self.assertTrue(imported_path.exists())
+            self.assertEqual(imported_path.read_text(encoding='utf-8'), '# External Decision\n')
+            self.assertEqual(data['imported_count'], 1)
+            self.assertIn('references/external/', source_text)
+            self.assertNotIn(str(external_doc), source_text)
+            self.assertEqual(len(imported_rows), 1)
+            self.assertEqual(imported_rows[0]['classification_source'], 'external_import')
+            self.assertEqual(imported_rows[0]['lifecycle_status'], 'closed')
+            self.assertEqual(imported_rows[0]['authoritative'], 'false')
+            self.assertIn('implementation_note', imported_rows[0]['notes'])
+
+            links = run_cli(root, 'graph', 'body-links')
+            body_data = json.loads(links.stdout)
+            self.assertEqual(body_data['edge_count'], 1)
+            self.assertEqual(body_data['external_reference_count'], 0)
+
 
 if __name__ == '__main__':
     unittest.main()

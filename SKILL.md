@@ -204,6 +204,7 @@ python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph lineage
 python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph impact <plan_id> --repo-root "$(pwd)"
 python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph conflicts --repo-root "$(pwd)"
 python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph body-links [plan_id] --repo-root "$(pwd)"
+python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py adopt-external-references --repo-root "$(pwd)"
 ```
 
 Graph query output is JSON. It is intended for agent consumption, not prose scraping. Treat `registry-direct` and `manual-confirmed` relationships as stronger evidence than inferred or derived relationships.
@@ -213,6 +214,8 @@ Graph query output is JSON. It is intended for agent consumption, not prose scra
 `graph conflicts` reports deterministic hard conflicts from registry state only. It does not report semantic or embedding-inferred conflicts.
 
 `graph body-links` extracts explicit Markdown links from registered document bodies. It reports repo-local `body-link` edges, outside-repo `external_reference` items, and unresolved references, but it does not write inferred relationships back to the registry. External references include existence and trust metadata. They stay outside the current repo graph unless a future workflow explicitly adopts them; `external_reference_roots` only marks configured local roots as trusted context.
+
+`adopt-external-references` is the localizing step for useful outside-repo Markdown references. By default it is a JSON dry run. With `--apply`, it copies existing external Markdown files into `external_reference_import_dir`, rewrites source links to repo-relative links, registers imported docs as non-authoritative governed context, and refreshes the timeline. Use this when a copied worktree is missing referenced plan docs, or when a project intentionally stores plan references in a nearby folder but wants the current repo graph to be self-contained.
 
 ### 4. Lint PlanGraph state
 
@@ -235,6 +238,8 @@ This checks for:
 - unresolved Markdown body links from registered plan documents
 
 Outside-repo local Markdown links are reported as `external_reference` context instead of failing lint by default. Missing repo-local links still fail lint because they point at broken or unregistered documents inside the governed repo.
+
+After adopting external references, run `graph body-links` again. If repo-local body-link edges remain sparse or semantically ambiguous, do not move to SQLite indexing yet.
 
 ### 5. Close or supersede a plan
 

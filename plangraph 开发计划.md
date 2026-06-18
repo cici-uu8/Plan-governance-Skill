@@ -555,6 +555,7 @@ Stop / Go：
 - 真实 oncall 仓库 Stop/Go 验证结果：`edge_count=1`、`unresolved_count=8`、`unresolved_ratio=88.89%`，8 条 unresolved 全部是 `outside-repo`。结论是 Stop：暂停进入 SQLite，不把稀疏且跨 worktree 的链接数据放进重索引。
 - 当前小步增强：把 repo 外本地绝对路径结构化为 `external_reference`，显示目标外部目录、文件是否存在、是否命中 `external_reference_roots`。默认不纳入当前项目图谱；trusted roots 只表示“可信外部上下文”，不表示“当前 repo 的执行依赖”。
 - 二次真实验证结果：默认配置下得到 `edge_count=1`、`external_reference_count=8`、`external_existing_count=8`、`unresolved_count=0`；在内存配置中加入 `/Users/cici/oncall agent/super_biz_agent_py-release-2026-03-21` 后，8 条外部引用全部标为 `trusted=true`。结论仍是 Stop SQLite：external refs 让上下文更清楚，但当前还不能证明它们是稳定的当前执行依赖。
+- 新增外部引用本地化接入：`adopt-external-references` 默认 dry-run；`--apply` 时复制有价值的外部 Markdown 到 `external_reference_import_dir`、重写源文档链接、注册为非 authoritative governed context，并刷新 timeline。这个阶段解决“复制 worktree 漏掉计划文件”和“用户计划分散在其他本地文件夹”的通用问题。
 
 Stop / Go：
 

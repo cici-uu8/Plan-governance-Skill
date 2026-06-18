@@ -9,6 +9,7 @@ execution_policy: auto
 update_mode: hybrid
 install_agents_block: true
 external_reference_roots: []
+external_reference_import_dir: docs/references/external
 frontmatter:
   managed_keys:
     - plan_id

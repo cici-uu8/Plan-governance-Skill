@@ -94,6 +94,7 @@ PlanGraph 当前先聚焦确定性基础：
 - 主动 register / refresh / close / supersede 维护
 - registry 和生命周期一致性 lint
 - mainline、lineage、impact、确定性 conflicts、显式 Markdown 正文链接和 repo 外部引用的内存图谱查询
+- 对有价值的外部 Markdown 引用做 dry-run / apply 本地化接入
 
 SQLite 索引、MCP server 和语义边是后续阶段，不是当前本地 skill 工作流的前置条件。正文链接抽取已经作为只读 graph query 提供。真实仓库验证已经说明：repo 外链接应该先被分类为 external references，而不是急着进入 SQLite。
 
@@ -135,6 +136,8 @@ agent 建立 `supersedes` / `superseded_by` 关系。
 agent 查询 PlanGraph，再决定当前事实来源。
 
 如果计划链接到另一个本地 checkout 或 worktree 里的文档，PlanGraph 会把它报告为 `external_reference`，并显示目标路径、文件是否存在、是否命中 configured trusted roots。外部引用默认只是上下文，不会变成当前 repo 的图谱边，也不会变成 registry 事实。
+
+如果这些外部文档其实是当前 repo 复制时漏掉的计划资料，agent 可以先运行 external-reference adoption dry run，再把有价值的 Markdown 引用复制进当前 repo，重写成相对链接，并把导入文档注册为受治理但不可执行的上下文。
 
 ## 真实产物
 
