@@ -20,6 +20,18 @@ def run_cli(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def run_mcp_session(root: Path, *messages: dict[str, object]) -> list[dict[str, object]]:
+    payload = '\n'.join(json.dumps(message) for message in messages) + '\n'
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), 'mcp', '--repo-root', str(root)],
+        input=payload,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+
+
 def init_git_repo(root: Path) -> None:
     subprocess.run(['git', 'init'], cwd=root, check=True, capture_output=True, text=True)
     subprocess.run(['git', 'config', 'user.email', 'plangraph@example.test'], cwd=root, check=True)
@@ -293,6 +305,34 @@ class GovernanceCommandTests(unittest.TestCase):
             self.assertTrue(data['stale'])
             self.assertEqual(data['error'], 'index stale')
             self.assertIn('sync', data['suggestion'])
+
+    def test_mcp_initialize_tools_and_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'week1_plan.md').write_text('# Week 1 RAG Plan\n\nSearchable body text.\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/week1_plan.md')
+            run_cli(root, 'index')
+
+            messages = run_mcp_session(
+                root,
+                {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}},
+                {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list', 'params': {}},
+                {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {'name': 'plangraph_query', 'arguments': {'text': 'searchable'}}},
+            )
+
+            self.assertEqual(messages[0]['result']['serverInfo']['name'], 'plangraph')
+            tool_names = {item['name'] for item in messages[1]['result']['tools']}
+            self.assertIn('plangraph_status', tool_names)
+            self.assertIn('plangraph_mainline', tool_names)
+            self.assertIn('plangraph_query', tool_names)
+            call_payload = json.loads(messages[2]['result']['content'][0]['text'])
+            self.assertEqual(call_payload['query'], 'query')
+            self.assertEqual(call_payload['count'], 1)
+            self.assertEqual(call_payload['results'][0]['doc_path'], 'docs/week1_plan.md')
 
     def test_register_close_and_supersede_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:

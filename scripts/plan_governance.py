@@ -34,6 +34,7 @@ IGNORE_PATH = '.plangraph.ignore'
 INDEX_DIR = '.plangraph'
 INDEX_DB_PATH = '.plangraph/plangraph.db'
 INDEX_SCHEMA_VERSION = 2
+MCP_PROTOCOL_VERSION = '2025-11-25'
 LEGACY_CONFIG_PATH = '.plan-governance.yml'
 LEGACY_IGNORE_PATH = '.plan-governance.ignore'
 AGENTS_BLOCK_START = '<!-- PLANGRAPH START -->'
@@ -2228,6 +2229,120 @@ def run_sync(repo_root: Path, cfg: dict[str, Any]) -> int:
     return 0
 
 
+def mcp_tools() -> list[dict[str, Any]]:
+    return [
+        {
+            'name': 'plangraph_status',
+            'description': 'Return SQLite cache status, freshness, and counts for the current repo.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {},
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'plangraph_mainline',
+            'description': 'Return the current mainline heads from the registry-backed graph.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    'workstream': {'type': 'string'},
+                },
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'plangraph_query',
+            'description': 'Search indexed plan titles, paths, bodies, and notes in the local SQLite cache.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    'text': {'type': 'string'},
+                },
+                'required': ['text'],
+                'additionalProperties': False,
+            },
+        },
+    ]
+
+
+def mcp_result(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'content': [
+            {
+                'type': 'text',
+                'text': json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            }
+        ],
+        'isError': bool(payload.get('error')),
+    }
+
+
+def mcp_call_tool(repo_root: Path, cfg: dict[str, Any], name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    arguments = arguments or {}
+    if name == 'plangraph_status':
+        return mcp_result(sqlite_status(repo_root, cfg))
+    if name == 'plangraph_mainline':
+        graph = load_graph(repo_root, cfg)
+        if graph is None:
+            return mcp_result({'error': 'registry missing', 'query': 'mainline'})
+        return mcp_result(graph.mainline(arguments.get('workstream') or None))
+    if name == 'plangraph_query':
+        text = str(arguments.get('text', '')).strip()
+        if not text:
+            return mcp_result({'error': 'text is required', 'query': 'query'})
+        return mcp_result(sqlite_query(repo_root, cfg, text))
+    return mcp_result({'error': f'unknown tool: {name}'})
+
+
+def mcp_handle_request(repo_root: Path, cfg: dict[str, Any], request: dict[str, Any]) -> dict[str, Any] | None:
+    if request.get('jsonrpc') != '2.0':
+        return {'jsonrpc': '2.0', 'id': request.get('id'), 'error': {'code': -32600, 'message': 'Invalid Request'}}
+    method = request.get('method')
+    request_id = request.get('id')
+    params = request.get('params') or {}
+    if method == 'initialize':
+        return {
+            'jsonrpc': '2.0',
+            'id': request_id,
+            'result': {
+                'protocolVersion': MCP_PROTOCOL_VERSION,
+                'serverInfo': {'name': 'plangraph', 'version': str(cfg.get('version', '1'))},
+                'capabilities': {
+                    'tools': {'listChanged': False},
+                },
+            },
+        }
+    if method == 'tools/list':
+        return {'jsonrpc': '2.0', 'id': request_id, 'result': {'tools': mcp_tools()}}
+    if method == 'tools/call':
+        tool_name = params.get('name', '')
+        return {'jsonrpc': '2.0', 'id': request_id, 'result': mcp_call_tool(repo_root, cfg, tool_name, params.get('arguments'))}
+    if method in {'initialized', 'notifications/initialized'}:
+        return None
+    return {'jsonrpc': '2.0', 'id': request_id, 'error': {'code': -32601, 'message': f'Method not found: {method}'}}
+
+
+def run_mcp(repo_root: Path, cfg: dict[str, Any]) -> int:
+    import sys
+
+    for line in sys.stdin:
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            request = json.loads(raw)
+        except json.JSONDecodeError:
+            response = {'jsonrpc': '2.0', 'id': None, 'error': {'code': -32700, 'message': 'Parse error'}}
+        else:
+            response = mcp_handle_request(repo_root, cfg, request)
+        if response is None:
+            continue
+        sys.stdout.write(json.dumps(response, ensure_ascii=False) + '\n')
+        sys.stdout.flush()
+    return 0
+
+
 def run_graph(repo_root: Path, cfg: dict[str, Any], ids: list[str], workstream: str | None = None) -> int:
     if not ids:
         print('ERROR: graph requires a query: mainline, lineage, impact, conflicts, or body-links')
@@ -3022,7 +3137,7 @@ def run_refresh(repo_root: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['init', 'bootstrap', 'refresh', 'register', 'graph', 'index', 'status', 'sync', 'query', 'lint', 'report', 'adopt-external-references', 'install-agents-block', 'remove-agents-block', 'close', 'supersede'])
+    parser.add_argument('command', choices=['init', 'bootstrap', 'refresh', 'register', 'graph', 'index', 'status', 'sync', 'query', 'mcp', 'lint', 'report', 'adopt-external-references', 'install-agents-block', 'remove-agents-block', 'close', 'supersede'])
     parser.add_argument('ids', nargs='*')
     parser.add_argument('--repo-root', default=os.getcwd())
     parser.add_argument('--lifecycle-status', default='closed')
@@ -3066,6 +3181,10 @@ def main() -> int:
             return 2
         cfg = load_effective_config(repo_root)
         return run_query(repo_root, cfg, ' '.join(args.ids))
+
+    if args.command == 'mcp':
+        cfg = load_effective_config(repo_root)
+        return run_mcp(repo_root, cfg)
 
     cfg = ensure_repo_files(repo_root)
 

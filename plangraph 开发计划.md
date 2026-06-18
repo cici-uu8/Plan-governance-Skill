@@ -628,7 +628,7 @@ Stop / Go：
 
 交付：
 
-- `plangraph serve --mcp`
+- `plangraph mcp` / `plangraph serve --mcp`
 - `plangraph install`
 - `plangraph uninstall`
 - MCP tools
@@ -641,9 +641,17 @@ Stop / Go：
 
 验收：
 
+- stdio MCP server 可完成 `initialize`、`tools/list`、`tools/call`（已完成第一版）
+- MCP tools 可读 status、mainline、query（已完成第一版）
 - Codex / Claude Code 至少一种宿主可接入
 - 未配置 MCP 时仍可通过 skill + CLI 使用
 - MCP 不取代 CLI
+
+当前状态：
+
+- 第一段本地 MCP 已完成：`mcp` 命令以 stdio JSON-RPC 方式暴露 `plangraph_status`、`plangraph_mainline`、`plangraph_query`。
+- MCP 只复用已有 SQLite/graph 查询，不引入新的真源。
+- 宿主安装、卸载、workspace discovery 尚未完成。
 
 Stop / Go：
 
