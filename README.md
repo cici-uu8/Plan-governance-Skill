@@ -93,7 +93,7 @@ PlanGraph currently focuses on the deterministic foundation:
 - current mainline separation
 - proactive register / refresh / close / supersede maintenance
 - lint rules for registry and lifecycle consistency
-- in-memory graph queries for mainline, lineage, and impact
+- in-memory graph queries for mainline, lineage, impact, and deterministic conflicts
 
 SQLite indexing, MCP server support, body-link extraction, and semantic edges are planned phases, not required for the current local-first skill workflow.
 
@@ -162,7 +162,7 @@ The timeline report is derived from the registry, so humans and agents can quick
   <img src="./assets/screenshot-timeline.png" alt="Plan timeline report screenshot" width="900" />
 </p>
 
-Sample Markdown outputs are available in [`examples/`](./examples/).
+Sample Markdown outputs and a GitHub Actions lint template are available in [`examples/`](./examples/).
 
 ## Boundaries And Exit
 

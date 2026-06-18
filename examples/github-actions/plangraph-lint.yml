@@ -1,0 +1,32 @@
+name: PlanGraph lint
+
+on:
+  pull_request:
+    paths:
+      - "**/*.md"
+      - ".plangraph.yml"
+      - ".plangraph.ignore"
+  workflow_dispatch:
+
+jobs:
+  plangraph-lint:
+    runs-on: ubuntu-latest
+    env:
+      # Pin this to a release tag once your repo standardizes on a PlanGraph version.
+      PLANGRAPH_REF: v0.3.0
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Download PlanGraph CLI
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/cici-uu8/PlanGraph/${PLANGRAPH_REF}/scripts/plan_governance.py" -o /tmp/plangraph.py
+          chmod +x /tmp/plangraph.py
+
+      - name: Lint governed plan state
+        run: python3 /tmp/plangraph.py lint --repo-root "$GITHUB_WORKSPACE"

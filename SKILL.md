@@ -202,9 +202,14 @@ Use graph queries before modifying important plans or when deciding which plan i
 python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph mainline --repo-root "$(pwd)"
 python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph lineage <plan_id> --repo-root "$(pwd)"
 python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph impact <plan_id> --repo-root "$(pwd)"
+python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph conflicts --repo-root "$(pwd)"
 ```
 
 Graph query output is JSON. It is intended for agent consumption, not prose scraping. Treat `registry-direct` and `manual-confirmed` relationships as stronger evidence than inferred or derived relationships.
+
+`graph mainline` includes `derivation`: `manual-pinned` when `mainline_mode=manual` and `mainline_doc_paths` are set, otherwise `auto-derived`. Auto-derived mainline output is a planning signal, not a human-confirmed single source of truth.
+
+`graph conflicts` reports deterministic hard conflicts from registry state only. It does not report semantic or embedding-inferred conflicts.
 
 ### 4. Lint PlanGraph state
 

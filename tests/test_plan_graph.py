@@ -47,6 +47,51 @@ class PlanGraphTests(unittest.TestCase):
         data = plan_governance.parse_simple_yaml_mapping('classification:\n  high_confidence_threshold: 0.85\n')
         self.assertEqual(data['classification']['high_confidence_threshold'], 0.85)
 
+    def test_load_yaml_falls_back_without_pyyaml(self):
+        original_yaml = plan_governance.yaml
+        plan_governance.yaml = None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / '.plangraph.yml'
+                path.write_text('classification:\n  high_confidence_threshold: 0.85\n', encoding='utf-8')
+                data = plan_governance.load_yaml(path)
+            self.assertEqual(data['classification']['high_confidence_threshold'], 0.85)
+        finally:
+            plan_governance.yaml = original_yaml
+
+    def test_frontmatter_falls_back_when_pyyaml_fails(self):
+        class ExplodingYaml:
+            @staticmethod
+            def safe_load(*_args, **_kwargs):
+                raise RuntimeError('simulated yaml failure')
+
+        original_yaml = plan_governance.yaml
+        plan_governance.yaml = ExplodingYaml()
+        try:
+            frontmatter = plan_governance.parse_frontmatter('---\nplan_id: root\nlifecycle_status: active\n---\nBody\n')
+            self.assertEqual(frontmatter['plan_id'], 'root')
+            self.assertEqual(frontmatter['lifecycle_status'], 'active')
+        finally:
+            plan_governance.yaml = original_yaml
+
+    def test_persist_config_uses_stable_internal_yaml_dumper(self):
+        class ExplodingYaml:
+            @staticmethod
+            def safe_dump(*_args, **_kwargs):
+                raise AssertionError('safe_dump should not be used for config writes')
+
+        original_yaml = plan_governance.yaml
+        plan_governance.yaml = ExplodingYaml()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                plan_governance.persist_config(root, {'version': 1, 'mainline_doc_paths': []})
+                content = (root / '.plangraph.yml').read_text(encoding='utf-8')
+                self.assertIn('version: 1', content)
+                self.assertIn('mainline_doc_paths:', content)
+        finally:
+            plan_governance.yaml = original_yaml
+
     def test_parse_registry_rows(self):
         rows = plan_governance.parse_registry_rows(registry_text(ROWS))
         self.assertEqual(len(rows), 4)
@@ -76,6 +121,20 @@ class PlanGraphTests(unittest.TestCase):
         impacted_ids = {item['plan']['plan_id'] for item in result['impacted']}
         self.assertIn('roadmap-v2', impacted_ids)
 
+    def test_conflicts_reports_deterministic_hard_conflicts(self):
+        rows = plan_governance.parse_registry_rows(registry_text([
+            ['root', 'Root', 'docs/root.md', 'master_plan', 'core', 'deferred', 'not_started', 'false', 'manual', '1.00', '', '', '', '', '', ''],
+            ['a', 'A', 'docs/a.md', 'execution_plan', 'core', 'active', 'in_progress', 'true', 'manual', '1.00', 'root', '', '', '', '', ''],
+            ['b', 'B', 'docs/b.md', 'execution_plan', 'core', 'active', 'not_started', 'true', 'manual', '1.00', '', '', '', '', '', ''],
+            ['old', 'Old', 'docs/old.md', 'execution_plan', 'core', 'closed', 'completed', 'false', 'manual', '1.00', '', '', 'a', '', '', ''],
+        ]))
+        result = plan_governance.PlanGraph(rows, {}).conflicts()
+        conflict_types = {item['type'] for item in result['conflicts']}
+        self.assertIn('multiple-active-authoritative-heads', conflict_types)
+        self.assertIn('active-plan-depends-on-non-active-parent', conflict_types)
+        self.assertIn('non-active-plan-has-execution-successor', conflict_types)
+        self.assertTrue(all(item['provenance'] == 'registry-derived' for item in result['conflicts']))
+
     def test_integrity_detects_cycle_and_orphan_parent(self):
         rows = plan_governance.parse_registry_rows(registry_text([
             ['a', 'A', 'docs/a.md', 'execution_plan', 'core', 'active', 'not_started', 'true', 'manual', '1.00', '', 'b', 'b', '', '', ''],
@@ -85,6 +144,19 @@ class PlanGraphTests(unittest.TestCase):
         joined = '\n'.join(errors)
         self.assertIn('supersession cycle', joined)
         self.assertIn('orphan parent_plan', joined)
+
+    def test_parent_lifecycle_is_conflict_not_integrity_error(self):
+        rows = plan_governance.parse_registry_rows(registry_text([
+            ['root', 'Root', 'docs/root.md', 'master_plan', 'core', 'deferred', 'not_started', 'false', 'manual', '1.00', '', '', '', '', '', ''],
+            ['child', 'Child', 'docs/child.md', 'execution_plan', 'core', 'active', 'in_progress', 'true', 'manual', '1.00', 'root', '', '', '', '', ''],
+        ]))
+        graph = plan_governance.PlanGraph(rows, {})
+
+        integrity_errors = graph.integrity_errors()
+        conflicts = graph.conflicts()['conflicts']
+
+        self.assertEqual(integrity_errors, [])
+        self.assertIn('active-plan-depends-on-non-active-parent', {item['type'] for item in conflicts})
 
     def test_cli_graph_lineage_outputs_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -101,6 +173,26 @@ class PlanGraphTests(unittest.TestCase):
             data = json.loads(result.stdout)
             self.assertEqual(data['query'], 'lineage')
             self.assertEqual(data['backward'][0]['plan_id'], 'roadmap-v1')
+
+    def test_cli_graph_conflicts_outputs_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            rows = [
+                ['a', 'A', 'docs/a.md', 'execution_plan', 'core', 'active', 'in_progress', 'true', 'manual', '1.00', '', '', '', '', '', ''],
+                ['b', 'B', 'docs/b.md', 'execution_plan', 'core', 'active', 'not_started', 'true', 'manual', '1.00', '', '', '', '', '', ''],
+            ]
+            (docs / 'plan_registry.md').write_text(registry_text(rows), encoding='utf-8')
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), 'graph', 'conflicts', '--repo-root', str(root)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            data = json.loads(result.stdout)
+            self.assertEqual(data['query'], 'conflicts')
+            self.assertEqual(data['conflicts'][0]['type'], 'multiple-active-authoritative-heads')
 
 
 if __name__ == '__main__':

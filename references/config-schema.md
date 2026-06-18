@@ -109,6 +109,8 @@ Notes:
 - `adoption_report_path` is used by the read-only `init` command.
 - `mainline_doc_paths` can explicitly name the current actionable mainline. When set, the timeline treats only those docs as executable mainline and shows other active plans as governed but non-executable.
 - `mainline_mode=auto` means the skill may update `mainline_doc_paths` from repo evidence. Set `mainline_mode=manual` when the repo owner wants to pin the mainline explicitly and stop automatic reassignment.
+- Config writes use PlanGraph's internal YAML dumper for stable output across environments, whether or not PyYAML is installed.
+- Config and frontmatter reads fall back to PlanGraph's internal simple YAML parser when PyYAML is unavailable or fails on simple managed metadata.
 - `execution_policy` may be set explicitly to values such as `strict_mainline` or `parallel_workstreams`. The default `auto` lets the skill infer whether the repo currently behaves like one mainline or several parallel workstreams.
 - `update_mode=hybrid` is the recommended default. It preserves existing registry rows and appends newly discovered high-confidence docs.
 - `install_agents_block=true` is the recommended default when a repo explicitly enables PlanGraph. Set it to `false` only when the project wants registry files without managed `AGENTS.md` enforcement.

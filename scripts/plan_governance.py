@@ -148,9 +148,17 @@ def load_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     text = path.read_text(encoding='utf-8')
-    if yaml is None:
-        return parse_simple_yaml_mapping(text)
-    data = yaml.safe_load(text)
+    return load_yaml_text(text)
+
+
+def load_yaml_text(text: str) -> dict[str, Any]:
+    if yaml is not None:
+        try:
+            data = yaml.safe_load(text)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+    data = parse_simple_yaml_mapping(text)
     return data or {}
 
 
@@ -280,10 +288,7 @@ def load_effective_config(repo_root: Path) -> dict[str, Any]:
 def persist_config(repo_root: Path, cfg: dict[str, Any]) -> None:
     config_path = repo_root / CONFIG_PATH
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    if yaml is None:
-        config_path.write_text(dump_simple_yaml(cfg).rstrip() + '\n', encoding='utf-8')
-        return
-    config_path.write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding='utf-8')
+    config_path.write_text(dump_simple_yaml(cfg).rstrip() + '\n', encoding='utf-8')
 
 
 def read_ignore_patterns(repo_root: Path) -> list[str]:
@@ -374,8 +379,7 @@ def parse_frontmatter(text: str) -> dict[str, Any]:
     if not match:
         return {}
     try:
-        data = yaml.safe_load(match.group(1)) if yaml is not None else parse_simple_yaml_mapping(match.group(1))
-        return data if isinstance(data, dict) else {}
+        return load_yaml_text(match.group(1))
     except Exception:
         return {}
 
@@ -387,8 +391,7 @@ def split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     if not match:
         return {}, text
     try:
-        data = yaml.safe_load(match.group(1)) if yaml is not None else parse_simple_yaml_mapping(match.group(1))
-        frontmatter = data if isinstance(data, dict) else {}
+        frontmatter = load_yaml_text(match.group(1))
     except Exception:
         frontmatter = {}
     return frontmatter, text[match.end():]
@@ -1148,6 +1151,9 @@ class PlanGraph:
 
     def mainline(self, workstream: str | None = None) -> dict[str, Any]:
         mainline_paths = set(infer_mainline_doc_paths(self.rows, self.cfg))
+        explicit_paths = normalize_repo_paths(self.cfg.get('mainline_doc_paths'))
+        is_manual = mainline_mode(self.cfg) == 'manual' and bool(explicit_paths)
+        derivation = 'manual-pinned' if is_manual else 'auto-derived'
         candidate_rows = [
             row for row in self.rows
             if row.get('lifecycle_status') == 'active'
@@ -1162,6 +1168,12 @@ class PlanGraph:
             'execution_policy': infer_execution_policy(self.rows, self.cfg),
             'heads': [row_summary(row) for row in heads],
             'mainline_doc_paths': sorted(mainline_paths),
+            'derivation': derivation,
+            'notes': (
+                'mainline is manually pinned through mainline_doc_paths'
+                if is_manual
+                else 'mainline is auto-derived from active heads and is not manually pinned'
+            ),
             'provenance': 'registry-derived',
         }
 
@@ -1200,6 +1212,78 @@ class PlanGraph:
             'provenance': 'registry-derived',
         }
 
+    def conflicts(self) -> dict[str, Any]:
+        conflicts: list[dict[str, Any]] = []
+
+        def add_conflict(conflict_type: str, message: str, rows: list[dict[str, str]], severity: str = 'error') -> None:
+            conflicts.append({
+                'type': conflict_type,
+                'severity': severity,
+                'message': message,
+                'plans': [row_summary(row) for row in rows],
+                'provenance': 'registry-derived',
+            })
+
+        active_authoritative_heads: dict[str, list[dict[str, str]]] = {}
+        for row in self.rows:
+            if (
+                row.get('doc_role') == 'execution_plan'
+                and row.get('lifecycle_status') == 'active'
+                and row.get('authoritative', '').lower() == 'true'
+                and not csv_ids(row.get('superseded_by', ''))
+            ):
+                active_authoritative_heads.setdefault(row.get('workstream', '') or 'general', []).append(row)
+        for workstream, rows in sorted(active_authoritative_heads.items()):
+            if len(rows) > 1:
+                add_conflict(
+                    'multiple-active-authoritative-heads',
+                    f'multiple active authoritative execution heads in workstream {workstream}',
+                    rows,
+                )
+
+        non_active_parent_statuses = {'closed', 'superseded', 'rejected', 'archived', 'deferred'}
+        for row in self.rows:
+            if row.get('lifecycle_status') != 'active':
+                continue
+            parent_id = row.get('parent_plan', '').strip()
+            if not parent_id:
+                continue
+            parent = self.by_id.get(parent_id)
+            if parent and parent.get('lifecycle_status') in non_active_parent_statuses:
+                add_conflict(
+                    'active-plan-depends-on-non-active-parent',
+                    f'active plan depends on non-active parent {parent_id} lifecycle={parent.get("lifecycle_status")}',
+                    [row, parent],
+                )
+
+        non_active_execution_statuses = {'closed', 'rejected', 'archived'}
+        for row in self.rows:
+            if row.get('lifecycle_status') not in non_active_execution_statuses:
+                continue
+            active_successors = [
+                self.by_id[target_id]
+                for target_id in csv_ids(row.get('superseded_by', ''))
+                if target_id in self.by_id
+                and self.by_id[target_id].get('doc_role') in {'execution_plan', 'workstream_plan'}
+                and self.by_id[target_id].get('lifecycle_status') == 'active'
+            ]
+            if active_successors:
+                add_conflict(
+                    'non-active-plan-has-execution-successor',
+                    f'non-active plan still points to active execution successor via superseded_by',
+                    [row] + active_successors,
+                )
+
+        return {
+            'query': 'conflicts',
+            'conflicts': conflicts,
+            'count': len(conflicts),
+            'provenance': 'registry-derived',
+        }
+
+    def conflict_errors(self) -> list[str]:
+        return [f'{item["type"]}: {item["message"]}' for item in self.conflicts()['conflicts']]
+
     def integrity_errors(self) -> list[str]:
         errors: list[str] = []
         errors.extend(self._supersession_cycle_errors())
@@ -1210,8 +1294,6 @@ class PlanGraph:
             parent_row = self.by_id.get(parent)
             if not parent_row:
                 errors.append(f'orphan parent_plan for {row["doc_path"]}: {parent}')
-            elif parent_row.get('lifecycle_status') in {'closed', 'rejected', 'archived'}:
-                errors.append(f'parent_plan points to non-active parent for {row["doc_path"]}: {parent} lifecycle={parent_row.get("lifecycle_status")}')
         return errors
 
     def _walk_supersedes(self, plan_id: str, direction: str) -> list[dict[str, str]]:
@@ -1265,7 +1347,7 @@ def load_graph(repo_root: Path, cfg: dict[str, Any]) -> PlanGraph | None:
 
 def run_graph(repo_root: Path, cfg: dict[str, Any], ids: list[str], workstream: str | None = None) -> int:
     if not ids:
-        print('ERROR: graph requires a query: mainline, lineage, or impact')
+        print('ERROR: graph requires a query: mainline, lineage, impact, or conflicts')
         return 2
     query = ids[0]
     graph = load_graph(repo_root, cfg)
@@ -1283,6 +1365,8 @@ def run_graph(repo_root: Path, cfg: dict[str, Any], ids: list[str], workstream: 
             print('ERROR: graph impact requires exactly one plan_id')
             return 2
         result = graph.impact(ids[1])
+    elif query == 'conflicts':
+        result = graph.conflicts()
     else:
         print(f'ERROR: unknown graph query: {query}')
         return 2
@@ -1608,7 +1692,6 @@ def lint(repo_root: Path, cfg: dict[str, Any]) -> int:
     role_enums = set(cfg.get('status_enums', {}).get('doc_role', []))
     managed_keys = cfg.get('frontmatter', {}).get('managed_keys', [])
 
-    seen_authoritative: dict[tuple[str, str], str] = {}
     seen_plan_ids: dict[str, str] = {}
     seen_doc_paths: set[str] = set()
     for r in rows:
@@ -1629,12 +1712,6 @@ def lint(repo_root: Path, cfg: dict[str, Any]) -> int:
             errors.append(f'invalid execution_status for {r["doc_path"]}: {r["execution_status"]}')
         if r['doc_role'] not in role_enums:
             errors.append(f'invalid doc_role for {r["doc_path"]}: {r["doc_role"]}')
-        key = (r['workstream'], r['doc_role'])
-        if r['authoritative'].lower() == 'true' and r['doc_role'] == 'execution_plan' and r['lifecycle_status'] == 'active':
-            if key in seen_authoritative:
-                errors.append(f'multiple authoritative execution docs in workstream {r["workstream"]}: {seen_authoritative[key]} and {r["doc_path"]}')
-            seen_authoritative[key] = r['doc_path']
-
         if doc.exists() and managed_keys:
             frontmatter = parse_frontmatter(doc.read_text(encoding='utf-8', errors='ignore'))
             for key_name in managed_keys:
@@ -1679,6 +1756,7 @@ def lint(repo_root: Path, cfg: dict[str, Any]) -> int:
         errors.append(f'unregistered candidate doc: {path}')
 
     errors.extend(graph.integrity_errors())
+    errors.extend(graph.conflict_errors())
 
     if errors:
         for e in errors:
