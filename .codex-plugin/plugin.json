@@ -1,6 +1,6 @@
 {
   "name": "plangraph",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Local-first planning graph plugin for project plan lineage, mainline, impact, and governance in Codex.",
   "author": {
     "name": "cici-uu8",

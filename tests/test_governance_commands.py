@@ -19,6 +19,17 @@ def run_cli(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def init_git_repo(root: Path) -> None:
+    subprocess.run(['git', 'init'], cwd=root, check=True, capture_output=True, text=True)
+    subprocess.run(['git', 'config', 'user.email', 'plangraph@example.test'], cwd=root, check=True)
+    subprocess.run(['git', 'config', 'user.name', 'PlanGraph Test'], cwd=root, check=True)
+
+
+def commit_all(root: Path, message: str) -> None:
+    subprocess.run(['git', 'add', '.'], cwd=root, check=True, capture_output=True, text=True)
+    subprocess.run(['git', 'commit', '-m', message], cwd=root, check=True, capture_output=True, text=True)
+
+
 def write_minimal_repo_config(root: Path) -> None:
     (root / '.plangraph.yml').write_text(
         '\n'.join([
@@ -179,6 +190,70 @@ class GovernanceCommandTests(unittest.TestCase):
             self.assertNotEqual(lint.returncode, 0)
             self.assertIn('unresolved body link', lint.stdout)
             self.assertIn('reason=missing-file', lint.stdout)
+
+    def test_lint_allows_closed_doc_markdown_link_target_repairs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            imported_docs = docs / 'references' / 'external'
+            imported_docs.mkdir(parents=True)
+            init_git_repo(root)
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            plan = docs / 'week1_plan.md'
+            plan.write_text(
+                '# Week 1 Plan\n\nSee [decision](https://example.test/old-decision.md).\n',
+                encoding='utf-8',
+            )
+            run_cli(root, 'register', 'docs/week1_plan.md')
+            plan_id = row_for_doc(root, 'docs/week1_plan.md')['plan_id']
+            run_cli(root, 'close', plan_id, '--execution-status', 'completed')
+            (imported_docs / 'decision.md').write_text('# Decision\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/references/external/decision.md')
+            commit_all(root, 'baseline closed plan')
+
+            plan.write_text(
+                '# Week 1 Plan\n\nSee [decision](references/external/decision.md).\n',
+                encoding='utf-8',
+            )
+
+            lint = run_cli(root, 'lint')
+
+            self.assertIn('plangraph lint: ok', lint.stdout)
+
+    def test_lint_still_rejects_closed_doc_link_label_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            init_git_repo(root)
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            plan = docs / 'week1_plan.md'
+            plan.write_text(
+                '# Week 1 Plan\n\nSee [decision](https://example.test/decision.md).\n',
+                encoding='utf-8',
+            )
+            run_cli(root, 'register', 'docs/week1_plan.md')
+            plan_id = row_for_doc(root, 'docs/week1_plan.md')['plan_id']
+            run_cli(root, 'close', plan_id, '--execution-status', 'completed')
+            commit_all(root, 'baseline closed plan')
+
+            plan.write_text(
+                '# Week 1 Plan\n\nSee [updated decision](https://example.test/decision.md).\n',
+                encoding='utf-8',
+            )
+
+            lint = subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), 'lint', '--repo-root', str(root)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(lint.returncode, 0)
+            self.assertIn('closed/superseded document body changed', lint.stdout)
 
     def test_lint_allows_trusted_existing_external_references(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -656,6 +656,14 @@ def doc_body(text: str) -> str:
 MARKDOWN_LINK_RE = re.compile(r'(?<!!)\[([^\]\n]+)\]\(([^)\n]+)\)')
 
 
+def body_without_markdown_link_targets(text: str) -> str:
+    return MARKDOWN_LINK_RE.sub(lambda match: f'[{match.group(1)}](<LINK_TARGET>)', text)
+
+
+def only_markdown_link_targets_changed(old_body: str, new_body: str) -> bool:
+    return old_body != new_body and body_without_markdown_link_targets(old_body) == body_without_markdown_link_targets(new_body)
+
+
 def strip_markdown_link_target(target: str) -> str:
     cleaned = target.strip()
     if not cleaned:
@@ -2017,7 +2025,9 @@ def lint(repo_root: Path, cfg: dict[str, Any]) -> int:
         if r['lifecycle_status'] in {'closed', 'superseded'}:
             baseline = read_git_file(repo_root, r['doc_path'])
             if baseline is not None and doc.exists():
-                if doc_body(baseline) != doc_body(doc.read_text(encoding='utf-8', errors='ignore')):
+                baseline_body = doc_body(baseline)
+                current_body = doc_body(doc.read_text(encoding='utf-8', errors='ignore'))
+                if baseline_body != current_body and not only_markdown_link_targets_changed(baseline_body, current_body):
                     errors.append(f'closed/superseded document body changed: {r["doc_path"]}')
 
         if r['superseded_by']:
