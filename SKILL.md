@@ -222,6 +222,8 @@ Graph query output is JSON. It is intended for agent consumption, not prose scra
 
 `graph mainline` includes `derivation`: `manual-pinned` when `mainline_mode=manual` and `mainline_doc_paths` are set, otherwise `auto-derived`. Auto-derived mainline output is a planning signal, not a human-confirmed single source of truth.
 
+`graph impact <plan_id>` and `graph context <plan_id>` default to compact ranked output. Compact mode keeps the selected plan, strong registry relationships, current mainline heads, conflicts, body-linked docs, and the highest-priority same-workstream items while reporting omitted counts. Use `--mode expanded` on the CLI or `mode: "expanded"` through MCP when the full related set is needed.
+
 `graph context <plan_id>` is a deterministic aggregation query. It combines the selected plan, same-workstream mainline view, lineage, impact, plan-specific deterministic conflicts, explicit body links, and a deduplicated `must_read` file list. It does not include semantic soft edges.
 
 `graph conflicts` reports deterministic hard conflicts from registry state only. In `strict_mainline` mode, multiple active `execution_plan` heads in the same workstream are a conflict even when none of them are marked authoritative, because a user or agent must pin, close, or supersede until one current head remains. It does not report semantic or embedding-inferred conflicts.

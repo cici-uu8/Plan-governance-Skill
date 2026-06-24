@@ -37,6 +37,7 @@ INDEX_DIR = '.plangraph'
 INDEX_DB_PATH = '.plangraph/plangraph.db'
 INDEX_SCHEMA_VERSION = 5
 INDEX_SCHEMA_NOTE = 'sqlite-like-fallback-for-short-and-cjk-query-terms'
+DEFAULT_COMPACT_RESULT_LIMIT = 8
 MCP_PROTOCOL_VERSION = '2025-11-25'
 DEFAULT_MCP_SERVER_NAME = 'plangraph'
 MCP_DISCOVERY_OVERRIDE_ENV_VARS = [
@@ -1518,7 +1519,7 @@ class PlanGraph:
             'provenance': 'registry-derived',
         }
 
-    def impact(self, plan_id: str) -> dict[str, Any]:
+    def impact(self, plan_id: str, mode: str = 'compact') -> dict[str, Any]:
         row = self.by_id.get(plan_id)
         if not row:
             return {'error': f'plan_id not found: {plan_id}', 'plan_id': plan_id}
@@ -1546,21 +1547,43 @@ class PlanGraph:
         for peer_id in self.workstream_index.get(row.get('workstream', '') or 'general', []):
             add(peer_id, 'same workstream', 'registry-derived')
 
+        all_impacted = sorted(
+            impacted.values(),
+            key=lambda item: (self.impact_priority(item), item['plan'].get('doc_path', '')),
+        )
+        expanded = mode == 'expanded'
+        displayed = all_impacted if expanded else all_impacted[:DEFAULT_COMPACT_RESULT_LIMIT]
         return {
             'query': 'impact',
+            'mode': 'expanded' if expanded else 'compact',
             'plan': row_summary(row),
-            'impacted': list(impacted.values()),
+            'impacted': displayed,
+            'impact_count': len(displayed),
+            'total_impact_count': len(all_impacted),
+            'omitted_impact_count': max(0, len(all_impacted) - len(displayed)),
             'provenance': 'registry-derived',
         }
 
-    def context(self, plan_id: str) -> dict[str, Any]:
+    def impact_priority(self, item: dict[str, Any]) -> int:
+        reasons = {reason.get('reason', '') for reason in item.get('reasons', [])}
+        plan = item.get('plan', {})
+        if any(reason != 'same workstream' for reason in reasons):
+            return 0
+        if plan.get('lifecycle_status') == 'active' and plan.get('doc_role') in {'master_plan', 'execution_plan'}:
+            return 1
+        if plan.get('lifecycle_status') == 'active':
+            return 2
+        return 3
+
+    def context(self, plan_id: str, mode: str = 'compact') -> dict[str, Any]:
         row = self.by_id.get(plan_id)
         if not row:
             return {'error': f'plan_id not found: {plan_id}', 'plan_id': plan_id, 'query': 'context'}
 
+        expanded = mode == 'expanded'
         mainline = self.mainline(row.get('workstream') or None)
         lineage = self.lineage(plan_id)
-        impact = self.impact(plan_id)
+        impact = self.impact(plan_id, mode='expanded' if expanded else 'compact')
         conflicts = self.conflicts()
         body_links = self.body_links(plan_id)
 
@@ -1618,8 +1641,11 @@ class PlanGraph:
                 if head.get('plan_id') != plan_id:
                     add_must_read(head_row, 'current-mainline-head')
 
+        all_must_read = sorted(must_read.values(), key=self.must_read_sort_key)
+        displayed_must_read = all_must_read if expanded else all_must_read[:DEFAULT_COMPACT_RESULT_LIMIT]
         result = {
             'query': 'context',
+            'mode': 'expanded' if expanded else 'compact',
             'plan': row_summary(row),
             'mainline': {
                 'workstream': mainline.get('workstream', ''),
@@ -1638,16 +1664,33 @@ class PlanGraph:
                 'provenance': 'registry-derived',
             },
             'body_links': body_links,
-            'must_read': sorted(must_read.values(), key=lambda item: (0 if 'selected-plan' in item['reasons'] else 1, item['doc_path'])),
-            'must_read_count': len(must_read),
+            'must_read': displayed_must_read,
+            'must_read_count': len(displayed_must_read),
+            'total_must_read_count': len(all_must_read),
+            'omitted_must_read_count': max(0, len(all_must_read) - len(displayed_must_read)),
             'notes': [
                 'Context is deterministic and registry-driven.',
+                'Default mode is compact; pass mode=expanded when a caller needs the full related set.',
                 'It aggregates mainline, lineage, impact, conflicts, and explicit body-link evidence for one plan.',
                 'It does not include semantic soft edges.',
             ],
             'provenance': 'registry-derived',
         }
         return result
+
+    def must_read_sort_key(self, item: dict[str, Any]) -> tuple[int, str]:
+        reasons = set(item.get('reasons', []))
+        if 'selected-plan' in reasons:
+            priority = 0
+        elif reasons & {'parent-plan', 'superseded-predecessor', 'superseding-successor', 'body-linked-doc'}:
+            priority = 1
+        elif 'current-mainline-head' in reasons:
+            priority = 2
+        elif reasons - {'same-workstream'}:
+            priority = 3
+        else:
+            priority = 4
+        return (priority, item.get('doc_path', ''))
 
     def body_links(self, plan_id: str | None = None) -> dict[str, Any]:
         if self.repo_root is None:
@@ -2664,6 +2707,11 @@ def run_semantic(repo_root: Path, cfg: dict[str, Any]) -> int:
 
 
 def mcp_tools() -> list[dict[str, Any]]:
+    mode_schema = {
+        'type': 'string',
+        'enum': ['compact', 'expanded'],
+        'description': 'compact returns a ranked short result by default; expanded returns the full related set.',
+    }
     return [
         {
             'name': 'plangraph_status',
@@ -2716,6 +2764,7 @@ def mcp_tools() -> list[dict[str, Any]]:
                 'type': 'object',
                 'properties': {
                     'plan_id': {'type': 'string'},
+                    'mode': mode_schema,
                 },
                 'required': ['plan_id'],
                 'additionalProperties': False,
@@ -2728,6 +2777,7 @@ def mcp_tools() -> list[dict[str, Any]]:
                 'type': 'object',
                 'properties': {
                     'plan_id': {'type': 'string'},
+                    'mode': mode_schema,
                 },
                 'required': ['plan_id'],
                 'additionalProperties': False,
@@ -2797,8 +2847,8 @@ def mcp_call_tool(repo_root: Path, cfg: dict[str, Any], name: str, arguments: di
         if name == 'plangraph_lineage':
             return mcp_result(graph.lineage(plan_id))
         if name == 'plangraph_context':
-            return mcp_result(graph.context(plan_id))
-        return mcp_result(graph.impact(plan_id))
+            return mcp_result(graph.context(plan_id, mode=str(arguments.get('mode', 'compact'))))
+        return mcp_result(graph.impact(plan_id, mode=str(arguments.get('mode', 'compact'))))
     return mcp_result({'error': f'unknown tool: {name}'})
 
 
@@ -2868,7 +2918,7 @@ def run_mcp(repo_root: Path, cfg: dict[str, Any]) -> int:
     return 0
 
 
-def run_graph(repo_root: Path, cfg: dict[str, Any], ids: list[str], workstream: str | None = None) -> int:
+def run_graph(repo_root: Path, cfg: dict[str, Any], ids: list[str], workstream: str | None = None, mode: str = 'compact') -> int:
     if not ids:
         print('ERROR: graph requires a query: mainline, lineage, impact, context, conflicts, or body-links')
         return 2
@@ -2887,12 +2937,12 @@ def run_graph(repo_root: Path, cfg: dict[str, Any], ids: list[str], workstream: 
         if len(ids) != 2:
             print('ERROR: graph impact requires exactly one plan_id')
             return 2
-        result = graph.impact(ids[1])
+        result = graph.impact(ids[1], mode=mode)
     elif query == 'context':
         if len(ids) != 2:
             print('ERROR: graph context requires exactly one plan_id')
             return 2
-        result = graph.context(ids[1])
+        result = graph.context(ids[1], mode=mode)
     elif query == 'conflicts':
         result = graph.conflicts()
     elif query == 'body-links':
@@ -3682,14 +3732,14 @@ def codex_mcp_get(name: str) -> dict[str, Any] | None:
 
 
 def plangraph_mcp_command(script_path: Path) -> list[str]:
-    return [sys.executable, str(script_path), 'mcp']
+    return [str(script_path), 'mcp']
 
 
 def expected_plangraph_mcp_transport(script_path: Path) -> dict[str, Any]:
     return {
         'type': 'stdio',
-        'command': sys.executable,
-        'args': [str(script_path), 'mcp'],
+        'command': str(script_path),
+        'args': ['mcp'],
         'env': {},
     }
 
@@ -3869,6 +3919,7 @@ def main() -> int:
     parser.add_argument('--lifecycle-status', default='closed')
     parser.add_argument('--execution-status')
     parser.add_argument('--workstream')
+    parser.add_argument('--mode', choices=['compact', 'expanded'], default='compact')
     parser.add_argument('--skip-install-agents-block', action='store_true')
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
@@ -3887,7 +3938,7 @@ def main() -> int:
 
     if args.command == 'graph':
         cfg = load_effective_config(repo_root)
-        return run_graph(repo_root, cfg, args.ids, workstream=args.workstream)
+        return run_graph(repo_root, cfg, args.ids, workstream=args.workstream, mode=args.mode)
 
     if args.command == 'index':
         cfg = load_effective_config(repo_root)

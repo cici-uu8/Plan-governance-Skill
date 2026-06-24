@@ -120,6 +120,31 @@ class PlanGraphTests(unittest.TestCase):
         result = graph.impact('week1')
         impacted_ids = {item['plan']['plan_id'] for item in result['impacted']}
         self.assertIn('roadmap-v2', impacted_ids)
+        self.assertEqual(result['mode'], 'compact')
+
+    def test_impact_defaults_to_compact_and_expanded_returns_all(self):
+        rows = [
+            ['target', 'Target', 'docs/target.md', 'execution_plan', 'core', 'active', 'in_progress', 'true', 'manual', '1.00', '', '', '', '', '', ''],
+        ]
+        rows.extend([
+            [f'peer-{index}', f'Peer {index}', f'docs/peer_{index}.md', 'execution_plan', 'core', 'active', 'not_started', 'false', 'manual', '1.00', '', '', '', '', '', '']
+            for index in range(12)
+        ])
+        graph = plan_governance.PlanGraph(plan_governance.parse_registry_rows(registry_text(rows)), {})
+
+        compact = graph.impact('target')
+        expanded = graph.impact('target', mode='expanded')
+
+        self.assertEqual(compact['mode'], 'compact')
+        self.assertEqual(compact['impact_count'], 8)
+        self.assertEqual(compact['total_impact_count'], 12)
+        self.assertEqual(compact['omitted_impact_count'], 4)
+        self.assertEqual(len(compact['impacted']), 8)
+        self.assertEqual(expanded['mode'], 'expanded')
+        self.assertEqual(expanded['impact_count'], 12)
+        self.assertEqual(expanded['total_impact_count'], 12)
+        self.assertEqual(expanded['omitted_impact_count'], 0)
+        self.assertEqual(len(expanded['impacted']), 12)
 
     def test_context_aggregates_must_read_and_related_queries(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -157,6 +182,30 @@ class PlanGraphTests(unittest.TestCase):
             self.assertIn('parent-plan', must_read['docs/roadmap_v2.md'])
             self.assertIn('docs/decision.md', must_read)
             self.assertIn('body-linked-doc', must_read['docs/decision.md'])
+
+    def test_context_defaults_to_compact_and_expanded_returns_full_must_read(self):
+        rows = [
+            ['target', 'Target', 'docs/target.md', 'execution_plan', 'core', 'active', 'in_progress', 'true', 'manual', '1.00', '', '', '', '', '', ''],
+        ]
+        rows.extend([
+            [f'peer-{index}', f'Peer {index}', f'docs/peer_{index}.md', 'execution_plan', 'core', 'active', 'not_started', 'false', 'manual', '1.00', '', '', '', '', '', '']
+            for index in range(12)
+        ])
+        graph = plan_governance.PlanGraph(plan_governance.parse_registry_rows(registry_text(rows)), {})
+
+        compact = graph.context('target')
+        expanded = graph.context('target', mode='expanded')
+
+        self.assertEqual(compact['mode'], 'compact')
+        self.assertLessEqual(compact['must_read_count'], 8)
+        self.assertEqual(compact['must_read_count'], len(compact['must_read']))
+        self.assertGreater(compact['total_must_read_count'], compact['must_read_count'])
+        self.assertGreater(compact['omitted_must_read_count'], 0)
+        self.assertEqual(compact['must_read'][0]['doc_path'], 'docs/target.md')
+        self.assertEqual(expanded['mode'], 'expanded')
+        self.assertEqual(expanded['must_read_count'], expanded['total_must_read_count'])
+        self.assertEqual(expanded['omitted_must_read_count'], 0)
+        self.assertGreater(expanded['must_read_count'], compact['must_read_count'])
 
     def test_conflicts_reports_deterministic_hard_conflicts(self):
         rows = plan_governance.parse_registry_rows(registry_text([

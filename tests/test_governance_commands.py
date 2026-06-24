@@ -452,6 +452,49 @@ class GovernanceCommandTests(unittest.TestCase):
             self.assertEqual(payload['body_links']['edge_count'], 1)
             self.assertGreaterEqual(payload['must_read_count'], 2)
 
+    def test_mcp_impact_and_context_support_compact_and_expanded_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'target_plan.md').write_text('# Target Plan\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/target_plan.md')
+            for index in range(12):
+                path = docs / f'peer_{index}_plan.md'
+                path.write_text(f'# Peer {index} Plan\n', encoding='utf-8')
+                run_cli(root, 'register', f'docs/peer_{index}_plan.md')
+            target_id = row_for_doc(root, 'docs/target_plan.md')['plan_id']
+
+            messages = run_mcp_session(
+                root,
+                {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}},
+                {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {'name': 'plangraph_impact', 'arguments': {'plan_id': target_id}}},
+                {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {'name': 'plangraph_impact', 'arguments': {'plan_id': target_id, 'mode': 'expanded'}}},
+                {'jsonrpc': '2.0', 'id': 4, 'method': 'tools/call', 'params': {'name': 'plangraph_context', 'arguments': {'plan_id': target_id}}},
+                {'jsonrpc': '2.0', 'id': 5, 'method': 'tools/call', 'params': {'name': 'plangraph_context', 'arguments': {'plan_id': target_id, 'mode': 'expanded'}}},
+            )
+            compact_impact = json.loads(messages[1]['result']['content'][0]['text'])
+            expanded_impact = json.loads(messages[2]['result']['content'][0]['text'])
+            compact_context = json.loads(messages[3]['result']['content'][0]['text'])
+            expanded_context = json.loads(messages[4]['result']['content'][0]['text'])
+
+            self.assertEqual(compact_impact['mode'], 'compact')
+            self.assertEqual(compact_impact['impact_count'], 8)
+            self.assertGreater(compact_impact['total_impact_count'], compact_impact['impact_count'])
+            self.assertGreater(compact_impact['omitted_impact_count'], 0)
+            self.assertEqual(expanded_impact['mode'], 'expanded')
+            self.assertEqual(expanded_impact['impact_count'], expanded_impact['total_impact_count'])
+            self.assertGreater(expanded_impact['impact_count'], compact_impact['impact_count'])
+
+            self.assertEqual(compact_context['mode'], 'compact')
+            self.assertLessEqual(compact_context['must_read_count'], 8)
+            self.assertGreater(compact_context['total_must_read_count'], compact_context['must_read_count'])
+            self.assertEqual(expanded_context['mode'], 'expanded')
+            self.assertEqual(expanded_context['must_read_count'], expanded_context['total_must_read_count'])
+            self.assertGreater(expanded_context['must_read_count'], compact_context['must_read_count'])
+
     def test_mcp_initialize_prefers_root_uri_workspace_discovery(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -484,8 +527,8 @@ class GovernanceCommandTests(unittest.TestCase):
                 'name': 'plangraph',
                 'transport': {
                     'type': 'stdio',
-                    'command': sys.executable,
-                    'args': [str(script_path), 'mcp'],
+                    'command': str(script_path),
+                    'args': ['mcp'],
                     'env': {},
                 },
             }
@@ -512,7 +555,6 @@ class GovernanceCommandTests(unittest.TestCase):
                 'add',
                 'plangraph',
                 '--',
-                sys.executable,
                 str(SCRIPT_PATH.resolve()),
                 'mcp',
             ]
@@ -576,7 +618,8 @@ class GovernanceCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(data['query'], 'mcp-discover')
         self.assertFalse(data['configured'])
-        self.assertEqual(data['expected_transport']['command'], sys.executable)
+        self.assertEqual(data['expected_transport']['command'], str(SCRIPT_PATH.resolve()))
+        self.assertEqual(data['expected_transport']['args'], ['mcp'])
 
     def test_semantic_edges_are_explicit_soft_hints(self):
         with tempfile.TemporaryDirectory() as tmp:

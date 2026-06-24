@@ -103,6 +103,8 @@ SQLite, MCP, and semantic edges are derived layers. The registry remains the sou
 
 SQLite query now keeps the fast FTS path for ordinary English phrase search, but it falls back to SQLite `LIKE '%term%'` matching when FTS returns zero rows. This is mainly for short CJK terms and substring-style lookups, so a Chinese user does not read "no result" as "document does not exist."
 
+`impact` and `context` default to compact ranked output so an agent can read the current plan, the most relevant related plans, conflicts, and must-read files without being flooded by every same-workstream historical document. Pass `--mode expanded` on the CLI, or `mode: "expanded"` through MCP, when a caller needs the full related set.
+
 ## Release Surface
 
 The supported public surface is the deterministic PlanGraph workflow: adoption scan, bootstrap, registry maintenance, lifecycle lint, and graph queries for mainline, lineage, impact, context, conflicts, body links, and external references.

@@ -659,9 +659,10 @@ Stop / Go：
 
 - stdio MCP server 可完成 `initialize`、`tools/list`、`tools/call`（已完成第一版）
 - MCP tools 可读 status、mainline、query（已完成第一版）
-- Codex / Claude Code 至少一种宿主可接入
+- Codex / Claude Code 至少一种宿主可接入（Codex 已完成）
 - 未配置 MCP 时仍可通过 skill + CLI 使用
 - MCP 不取代 CLI
+- 默认输出不能把 agent 淹没在全量同 workstream 文档中；`impact` / `context` 需要 compact 默认输出和 expanded 全量模式（已完成）
 
 当前状态：
 
@@ -669,6 +670,8 @@ Stop / Go：
 - MCP 只复用已有 SQLite/graph 查询，不引入新的真源。
 - Codex 第一宿主已完成：`install` / `uninstall` / `discover-mcp` 直接复用 `codex mcp add|get|remove`，不手写宿主配置文件。
 - workspace discovery 已完成第一版：server 在 `initialize` 阶段优先消费 `rootUri` / `workspaceFolders`，把后续 `tools/call` 绑定到发现到的 repo root；`PLANGRAPH_REPO_ROOT` 只保留为 override，不要求每个仓库单独维护静态 MCP entry。
+- 真实 Codex 配置验收已完成：`install` 后 `codex mcp list` 能看到 `plangraph`，`discover-mcp` 显示 `configured=true`、`matches_expected=true`。当前已启动会话仍需要重启或新开会话，才能在工具列表中出现 `mcp__plangraph__...`。
+- `plangraph_impact` / `plangraph_context` 默认进入 compact ranked 输出，最多展示 8 条核心结果并返回 omitted/total 计数；传 `mode=expanded` 时返回完整 related set。
 
 Stop / Go：
 
