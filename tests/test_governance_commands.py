@@ -519,6 +519,81 @@ class GovernanceCommandTests(unittest.TestCase):
             self.assertEqual(messages[0]['result']['meta']['discovery_source'], 'initialize.rootUri')
             self.assertTrue(messages[0]['result']['meta']['index_exists'])
 
+    def test_mcp_initialize_discovers_unique_child_governed_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = workspace / 'repo'
+            docs = root / 'docs'
+            docs.mkdir(parents=True)
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            run_cli(root, 'index')
+
+            messages = run_mcp_session(
+                workspace,
+                {
+                    'jsonrpc': '2.0',
+                    'id': 1,
+                    'method': 'initialize',
+                    'params': {'rootUri': workspace.as_uri()},
+                },
+            )
+
+            self.assertEqual(Path(messages[0]['result']['meta']['workspace_root']), root.resolve())
+            self.assertEqual(messages[0]['result']['meta']['discovery_source'], 'initialize.rootUri')
+            self.assertEqual(messages[0]['result']['meta']['discovery_marker'], 'child:.plangraph.yml')
+            self.assertTrue(messages[0]['result']['meta']['index_exists'])
+
+    def test_mcp_initialize_does_not_guess_between_multiple_child_repos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            for name in ['repo-a', 'repo-b']:
+                root = workspace / name
+                (root / 'docs').mkdir(parents=True)
+                write_minimal_repo_config(root)
+                run_cli(root, 'bootstrap', '--skip-install-agents-block')
+
+            messages = run_mcp_session(
+                workspace,
+                {
+                    'jsonrpc': '2.0',
+                    'id': 1,
+                    'method': 'initialize',
+                    'params': {'rootUri': workspace.as_uri()},
+                },
+            )
+
+            self.assertEqual(Path(messages[0]['result']['meta']['workspace_root']), workspace.resolve())
+            self.assertEqual(messages[0]['result']['meta']['discovery_marker'], 'workspace-root')
+            self.assertFalse(messages[0]['result']['meta']['index_exists'])
+
+    def test_mcp_tools_accept_project_path_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = workspace / 'repo'
+            docs = root / 'docs'
+            docs.mkdir(parents=True)
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'roadmap_plan.md').write_text('# Roadmap Plan\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/roadmap_plan.md')
+            run_cli(root, 'index')
+
+            messages = run_mcp_session(
+                workspace,
+                {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'rootUri': workspace.as_uri()}},
+                {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {'name': 'plangraph_mainline', 'arguments': {'projectPath': str(root)}}},
+                {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {'name': 'plangraph_query', 'arguments': {'repo_root': str(root), 'text': 'Roadmap'}}},
+            )
+            mainline_payload = json.loads(messages[1]['result']['content'][0]['text'])
+            query_payload = json.loads(messages[2]['result']['content'][0]['text'])
+
+            self.assertEqual(mainline_payload['query'], 'mainline')
+            self.assertEqual(mainline_payload['heads'][0]['doc_path'], 'docs/roadmap_plan.md')
+            self.assertEqual(query_payload['query'], 'query')
+            self.assertEqual(query_payload['count'], 1)
+            self.assertEqual(query_payload['results'][0]['doc_path'], 'docs/roadmap_plan.md')
+
     def test_install_reports_already_configured_codex_mcp(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

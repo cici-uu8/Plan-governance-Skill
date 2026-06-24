@@ -209,6 +209,8 @@ This install path is intentionally host-scoped:
 
 - it configures one global `plangraph` MCP entry in Codex instead of one static server per repo
 - the server discovers the active repo from MCP `rootUri` / `workspaceFolders`
+- if the workspace root is a parent folder, the server auto-selects a single nearest governed child repo when exactly one exists
+- MCP tools also accept `projectPath` or `repo_root` when an agent needs to target a specific governed repo explicitly
 - `PLANGRAPH_REPO_ROOT` remains available as a manual override for hosts or scripts that cannot send workspace metadata
 - restart Codex after install or uninstall so the MCP tool list refreshes
 

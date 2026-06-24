@@ -268,6 +268,8 @@ python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py uninstall
 
 This install path is intentionally global-to-Codex rather than per-repo static config. The server should discover the active workspace from MCP `rootUri` / `workspaceFolders`; `PLANGRAPH_REPO_ROOT` remains only as an override when a host cannot send workspace metadata.
 
+When the MCP workspace root is a parent directory, the server may auto-select a single nearest governed child repo if exactly one child contains `.plangraph.yml`, the legacy config, or `docs/plan_registry.md`. It must not guess when several governed child repos are equally near. Read-only MCP tools also accept `projectPath` or `repo_root` so an agent can explicitly target a governed repo, matching CodeGraph-style per-tool project routing.
+
 Use `semantic` only as an explicit advanced operation. It builds `semantic-inferred` soft edges in the local SQLite cache, never writes them to the registry, and never makes them fatal lint errors. Ordinary `query` output must stay deterministic text search and must not include `semantic_results` by default. `semantic` should prioritize high-confidence pairs that have no direct registry hard relation and are not in the same workstream, so it surfaces likely incremental context rather than repeating known hard edges.
 
 ### 5. Close or supersede a plan

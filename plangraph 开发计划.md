@@ -669,7 +669,7 @@ Stop / Go：
 - 第一段本地 MCP 已完成：`mcp` 命令以 stdio JSON-RPC 方式暴露 `plangraph_status`、`plangraph_mainline`、`plangraph_query`、`plangraph_lineage`、`plangraph_impact`、`plangraph_context`、`plangraph_conflicts` 和 `plangraph_body_links`。
 - MCP 只复用已有 SQLite/graph 查询，不引入新的真源。
 - Codex 第一宿主已完成：`install` / `uninstall` / `discover-mcp` 直接复用 `codex mcp add|get|remove`，不手写宿主配置文件。
-- workspace discovery 已完成第一版：server 在 `initialize` 阶段优先消费 `rootUri` / `workspaceFolders`，把后续 `tools/call` 绑定到发现到的 repo root；`PLANGRAPH_REPO_ROOT` 只保留为 override，不要求每个仓库单独维护静态 MCP entry。
+- workspace discovery 已完成第二版：server 在 `initialize` 阶段优先消费 `rootUri` / `workspaceFolders`，当 workspace 是父目录且只有一个最近 governed 子仓库时自动选中该子仓库；每个 MCP tool 也接受 `projectPath` / `repo_root` 做显式项目路由。`PLANGRAPH_REPO_ROOT` 只保留为 override，不要求每个仓库单独维护静态 MCP entry。
 - 真实 Codex 配置验收已完成：`install` 后 `codex mcp list` 能看到 `plangraph`，`discover-mcp` 显示 `configured=true`、`matches_expected=true`。当前已启动会话仍需要重启或新开会话，才能在工具列表中出现 `mcp__plangraph__...`。
 - `plangraph_impact` / `plangraph_context` 默认进入 compact ranked 输出，最多展示 8 条核心结果并返回 omitted/total 计数；传 `mode=expanded` 时返回完整 related set。
 

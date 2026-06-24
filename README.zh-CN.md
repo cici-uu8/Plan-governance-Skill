@@ -209,6 +209,8 @@ python3 scripts/plan_governance.py uninstall
 
 - 只在 Codex 里配置一个全局 `plangraph` MCP entry，不为每个仓库单独写静态 server
 - server 通过 MCP `rootUri` / `workspaceFolders` 自动发现当前 repo root
+- 如果 workspace root 是父目录，且下面只有一个最近的 governed 子仓库，server 会自动选中这个子仓库
+- MCP tools 也接受 `projectPath` 或 `repo_root`，让 agent 可以显式指定要查询的 governed repo
 - 对不能传 workspace metadata 的宿主或脚本，仍可用 `PLANGRAPH_REPO_ROOT` 做手工覆盖
 - install / uninstall 后需要重启 Codex，让 MCP 工具列表刷新
 

@@ -48,6 +48,22 @@ MCP_DISCOVERY_OVERRIDE_ENV_VARS = [
 MCP_DISCOVERY_WEAK_ENV_VARS = [
     'PWD',
 ]
+MCP_DISCOVERY_MODE = 'initialize-rootUri-with-unique-child-and-tool-override'
+MCP_REPO_ARGUMENT_KEYS = [
+    'projectPath',
+    'project_path',
+    'repoRoot',
+    'repo_root',
+]
+DISCOVERY_EXCLUDED_DIRS = {
+    '.git',
+    '.hg',
+    '.svn',
+    '.venv',
+    'venv',
+    'node_modules',
+    '__pycache__',
+}
 LEGACY_CONFIG_PATH = '.plan-governance.yml'
 LEGACY_IGNORE_PATH = '.plan-governance.ignore'
 AGENTS_BLOCK_START = '<!-- PLANGRAPH START -->'
@@ -271,7 +287,45 @@ def discover_repo_root(candidate: Path) -> tuple[Path, str]:
             return probe, LEGACY_CONFIG_PATH
         if (probe / 'docs' / 'plan_registry.md').exists():
             return probe, 'docs/plan_registry.md'
+    child_repo = discover_unique_child_repo_root(current)
+    if child_repo is not None:
+        return child_repo
     return current, 'workspace-root'
+
+
+def discover_unique_child_repo_root(root: Path) -> tuple[Path, str] | None:
+    if not root.exists() or not root.is_dir():
+        return None
+    matches: list[tuple[int, Path, str]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in DISCOVERY_EXCLUDED_DIRS
+            and not name.endswith('.app')
+        ]
+        path = Path(dirpath)
+        marker = ''
+        if CONFIG_PATH in filenames:
+            marker = CONFIG_PATH
+        elif LEGACY_CONFIG_PATH in filenames:
+            marker = LEGACY_CONFIG_PATH
+        elif 'docs' in dirnames and (path / 'docs' / 'plan_registry.md').exists():
+            marker = 'docs/plan_registry.md'
+        if marker:
+            try:
+                depth = len(path.relative_to(root).parts)
+            except ValueError:
+                depth = 0
+            matches.append((depth, path.resolve(), marker))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (item[0], item[1].as_posix()))
+    nearest_depth = matches[0][0]
+    nearest = [item for item in matches if item[0] == nearest_depth]
+    if len(nearest) == 1:
+        _, path, marker = nearest[0]
+        return path, f'child:{marker}'
+    return None
 
 
 def resolve_mcp_repo_root(params: dict[str, Any] | None, fallback_repo_root: Path) -> tuple[Path, str, str]:
@@ -300,6 +354,20 @@ def resolve_mcp_repo_root(params: dict[str, Any] | None, fallback_repo_root: Pat
         return repo_root, source, marker
     repo_root, marker = discover_repo_root(fallback_repo_root)
     return repo_root, 'fallback.repo_root', marker
+
+
+def resolve_mcp_tool_repo_root(
+    arguments: dict[str, Any],
+    active_repo_root: Path,
+    active_cfg: dict[str, Any],
+) -> tuple[Path, dict[str, Any], str, str]:
+    for key in MCP_REPO_ARGUMENT_KEYS:
+        candidate = candidate_workspace_path(arguments.get(key))
+        if candidate is None:
+            continue
+        repo_root, marker = discover_repo_root(candidate)
+        return repo_root, load_effective_config(repo_root), f'arguments.{key}', marker
+    return active_repo_root, active_cfg, 'session.workspace_root', 'active'
 
 
 def dump_simple_yaml(data: Any, indent: int = 0) -> str:
@@ -2712,13 +2780,23 @@ def mcp_tools() -> list[dict[str, Any]]:
         'enum': ['compact', 'expanded'],
         'description': 'compact returns a ranked short result by default; expanded returns the full related set.',
     }
+    repo_arg_schema = {
+        'type': 'string',
+        'description': 'Optional path to a governed PlanGraph project. Use this when the MCP workspace root is a parent folder.',
+    }
+    repo_args = {
+        'projectPath': repo_arg_schema,
+        'repo_root': repo_arg_schema,
+    }
     return [
         {
             'name': 'plangraph_status',
             'description': 'Return SQLite cache status, freshness, and counts for the current repo.',
             'inputSchema': {
                 'type': 'object',
-                'properties': {},
+                'properties': {
+                    **repo_args,
+                },
                 'additionalProperties': False,
             },
         },
@@ -2728,6 +2806,7 @@ def mcp_tools() -> list[dict[str, Any]]:
             'inputSchema': {
                 'type': 'object',
                 'properties': {
+                    **repo_args,
                     'workstream': {'type': 'string'},
                 },
                 'additionalProperties': False,
@@ -2739,6 +2818,7 @@ def mcp_tools() -> list[dict[str, Any]]:
             'inputSchema': {
                 'type': 'object',
                 'properties': {
+                    **repo_args,
                     'text': {'type': 'string'},
                 },
                 'required': ['text'],
@@ -2751,6 +2831,7 @@ def mcp_tools() -> list[dict[str, Any]]:
             'inputSchema': {
                 'type': 'object',
                 'properties': {
+                    **repo_args,
                     'plan_id': {'type': 'string'},
                 },
                 'required': ['plan_id'],
@@ -2763,6 +2844,7 @@ def mcp_tools() -> list[dict[str, Any]]:
             'inputSchema': {
                 'type': 'object',
                 'properties': {
+                    **repo_args,
                     'plan_id': {'type': 'string'},
                     'mode': mode_schema,
                 },
@@ -2776,6 +2858,7 @@ def mcp_tools() -> list[dict[str, Any]]:
             'inputSchema': {
                 'type': 'object',
                 'properties': {
+                    **repo_args,
                     'plan_id': {'type': 'string'},
                     'mode': mode_schema,
                 },
@@ -2788,7 +2871,9 @@ def mcp_tools() -> list[dict[str, Any]]:
             'description': 'Return deterministic registry-derived planning conflicts.',
             'inputSchema': {
                 'type': 'object',
-                'properties': {},
+                'properties': {
+                    **repo_args,
+                },
                 'additionalProperties': False,
             },
         },
@@ -2798,6 +2883,7 @@ def mcp_tools() -> list[dict[str, Any]]:
             'inputSchema': {
                 'type': 'object',
                 'properties': {
+                    **repo_args,
                     'plan_id': {'type': 'string'},
                 },
                 'additionalProperties': False,
@@ -2820,10 +2906,11 @@ def mcp_result(payload: dict[str, Any]) -> dict[str, Any]:
 
 def mcp_call_tool(repo_root: Path, cfg: dict[str, Any], name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     arguments = arguments or {}
+    tool_repo_root, tool_cfg, _, _ = resolve_mcp_tool_repo_root(arguments, repo_root, cfg)
     if name == 'plangraph_status':
-        return mcp_result(sqlite_status(repo_root, cfg))
+        return mcp_result(sqlite_status(tool_repo_root, tool_cfg))
     if name == 'plangraph_mainline':
-        graph = load_graph(repo_root, cfg)
+        graph = load_graph(tool_repo_root, tool_cfg)
         if graph is None:
             return mcp_result({'error': 'registry missing', 'query': 'mainline'})
         return mcp_result(graph.mainline(arguments.get('workstream') or None))
@@ -2831,9 +2918,9 @@ def mcp_call_tool(repo_root: Path, cfg: dict[str, Any], name: str, arguments: di
         text = str(arguments.get('text', '')).strip()
         if not text:
             return mcp_result({'error': 'text is required', 'query': 'query'})
-        return mcp_result(sqlite_query(repo_root, cfg, text))
+        return mcp_result(sqlite_query(tool_repo_root, tool_cfg, text))
     if name in {'plangraph_lineage', 'plangraph_impact', 'plangraph_context', 'plangraph_conflicts', 'plangraph_body_links'}:
-        graph = load_graph(repo_root, cfg)
+        graph = load_graph(tool_repo_root, tool_cfg)
         if graph is None:
             return mcp_result({'error': 'registry missing', 'query': name.removeprefix('plangraph_').replace('_', '-')})
         if name == 'plangraph_conflicts':
@@ -3767,13 +3854,15 @@ def install_mcp_server(repo_root: Path, script_path: Path, name: str = DEFAULT_M
             'transport': expected,
             'workspace_root': str(repo_root),
             'discovery': {
-                'mode': 'initialize-rootUri-with-optional-env-override',
+                'mode': MCP_DISCOVERY_MODE,
                 'override_env_vars': MCP_DISCOVERY_OVERRIDE_ENV_VARS,
+                'tool_arguments': ['projectPath', 'repo_root'],
             },
             'restart_required': True,
             'notes': [
                 'Codex MCP server already matches the expected PlanGraph stdio configuration.',
-                'Repo discovery comes from initialize rootUri/workspaceFolders when the host provides them.',
+                'Repo discovery comes from initialize rootUri/workspaceFolders when the host provides them, including one unique governed child repo under a parent workspace.',
+                'Agents may pass projectPath or repo_root per tool call to target a specific governed repo.',
                 'Restart Codex if the MCP tool list does not refresh automatically.',
             ],
         }
@@ -3827,13 +3916,15 @@ def install_mcp_server(repo_root: Path, script_path: Path, name: str = DEFAULT_M
         'transport': expected,
         'workspace_root': str(repo_root),
         'discovery': {
-            'mode': 'initialize-rootUri-with-optional-env-override',
+            'mode': MCP_DISCOVERY_MODE,
             'override_env_vars': MCP_DISCOVERY_OVERRIDE_ENV_VARS,
+            'tool_arguments': ['projectPath', 'repo_root'],
         },
         'restart_required': True,
         'notes': [
             'Codex MCP entry now launches the local PlanGraph stdio server.',
-            'The server discovers the active repo from initialize rootUri/workspaceFolders instead of a per-repo static MCP entry.',
+            'The server discovers the active repo from initialize rootUri/workspaceFolders, including one unique governed child repo under a parent workspace.',
+            'Agents may pass projectPath or repo_root per tool call to target a specific governed repo.',
             'Restart Codex so the new MCP tools become available in interactive sessions.',
         ],
     }
@@ -3899,8 +3990,9 @@ def describe_mcp_installation(repo_root: Path, script_path: Path, name: str = DE
         'matches_expected': False,
         'configured_transport': None,
         'discovery': {
-            'mode': 'initialize-rootUri-with-optional-env-override',
+            'mode': MCP_DISCOVERY_MODE,
             'override_env_vars': MCP_DISCOVERY_OVERRIDE_ENV_VARS,
+            'tool_arguments': ['projectPath', 'repo_root'],
         },
     }
     if existing is not None:
