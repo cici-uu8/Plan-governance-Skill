@@ -43,6 +43,14 @@ PlanGraph 把分散的 roadmap、执行清单、closeout、状态文档、决策
 | 当前工作、历史 closeout、未来草案混在一起 | 区分可执行主线、deferred、superseded、closed 和 governed references |
 | Agent 准备修改计划但不了解历史影响 | 提供 lineage、impact、conflict 和 context 查询 |
 
+## 它怎么运行
+
+PlanGraph 不替代你的项目计划。它把计划的生命周期和关系显式化，然后在 agent 修改任何计划前，提供紧凑的图谱查询结果。
+
+<p align="center">
+  <img src="./assets/how-it-works.png" alt="How PlanGraph turns scattered plan docs into agent context" width="900" />
+</p>
+
 ## 30 秒开始
 
 ### 方式一：用 `npx skills` 安装（推荐）

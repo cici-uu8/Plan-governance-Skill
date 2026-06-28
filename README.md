@@ -43,6 +43,14 @@ PlanGraph turns scattered roadmaps, execution checklists, closeouts, state docs,
 | Current work is mixed with historical closeouts and future drafts | Separates executable mainline, deferred work, superseded docs, closed docs, and governed references |
 | An agent is about to change a plan without historical context | Provides graph queries for lineage, impact, conflicts, and related context |
 
+## How It Works
+
+PlanGraph does not replace your project plans. It makes their lifecycle and relationships explicit, then gives agents compact graph queries before they edit anything.
+
+<p align="center">
+  <img src="./assets/how-it-works.png" alt="How PlanGraph turns scattered plan docs into agent context" width="900" />
+</p>
+
 ## 30-Second Start
 
 ### Option 1: install with `npx skills` (recommended)

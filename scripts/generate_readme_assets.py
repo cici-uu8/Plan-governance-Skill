@@ -27,6 +27,10 @@ TEAL = "#14B8A6"
 TEAL_DARK = "#0F766E"
 AMBER = "#F59E0B"
 RED = "#F97316"
+BLUE = "#38BDF8"
+SLATE = "#334155"
+INK = "#0F172A"
+PAPER = "#F8FAFC"
 GRID = "#173543"
 WHITE = "#FFFFFF"
 
@@ -107,20 +111,56 @@ def card_title(draw: ImageDraw.ImageDraw, x: int, y: int, text: str) -> int:
     return y + 42
 
 
+def centered_text(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], text: str, *, font_obj: ImageFont.FreeTypeFont, fill: str) -> None:
+    left, top, right, bottom = box
+    bbox = draw.textbbox((0, 0), text, font=font_obj)
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+    draw.text((left + (right - left - w) / 2, top + (bottom - top - h) / 2 - 2), text, font=font_obj, fill=fill)
+
+
+def draw_arrow(draw: ImageDraw.ImageDraw, start: tuple[int, int], end: tuple[int, int], *, fill: str = TEAL, width: int = 5) -> None:
+    sx, sy = start
+    ex, ey = end
+    draw.line((sx, sy, ex, ey), fill=fill, width=width)
+    if ex >= sx:
+        head = [(ex, ey), (ex - 18, ey - 11), (ex - 18, ey + 11)]
+    else:
+        head = [(ex, ey), (ex + 18, ey - 11), (ex + 18, ey + 11)]
+    draw.polygon(head, fill=fill)
+
+
+def draw_doc_icon(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int, *, label: str, accent: str) -> None:
+    rounded(draw, (x, y, x + w, y + h), fill=PAPER, radius=16, outline="#CBD5E1", width=2)
+    draw.polygon([(x + w - 38, y), (x + w, y + 38), (x + w - 38, y + 38)], fill="#E2E8F0")
+    draw.line((x + 24, y + 52, x + w - 40, y + 52), fill=accent, width=6)
+    draw.line((x + 24, y + 82, x + w - 26, y + 82), fill="#CBD5E1", width=4)
+    draw.line((x + 24, y + 108, x + w - 50, y + 108), fill="#CBD5E1", width=4)
+    if label:
+        centered_text(draw, (x + 18, y + h - 54, x + w - 18, y + h - 16), label, font_obj=font(19, bold=True), fill=INK)
+
+
+def draw_graph_node(draw: ImageDraw.ImageDraw, x: int, y: int, r: int, *, fill: str, outline: str = BG) -> None:
+    draw.ellipse((x - r, y - r, x + r, y + r), fill=fill, outline=outline, width=5)
+
+
 def generate_logo() -> None:
-    img = Image.new("RGBA", (512, 512), BG)
+    img = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    rounded(draw, (48, 48, 464, 464), fill=PANEL, radius=72, outline=TEAL_DARK, width=3)
-    rounded(draw, (104, 92, 408, 180), fill=TEAL_DARK, radius=34)
-    draw.text((136, 114), "PLAN", font=font(56, bold=True), fill=WHITE)
-    rounded(draw, (104, 206, 408, 294), fill=PANEL_ALT, radius=34, outline=GRID, width=2)
-    draw.text((132, 228), "REGISTRY", font=font(46, bold=True), fill=TEXT)
-    rounded(draw, (104, 320, 248, 388), fill=AMBER, radius=24)
-    draw.text((132, 337), "INIT", font=font(32, bold=True), fill=BG)
-    rounded(draw, (264, 320, 408, 388), fill=TEAL, radius=24)
-    draw.text((292, 337), "AUTO", font=font(32, bold=True), fill=BG)
-    draw.line((256, 180, 256, 320), fill=TEAL, width=6)
-    draw.polygon([(256, 320), (240, 292), (272, 292)], fill=TEAL)
+    rounded(draw, (48, 48, 464, 464), fill=BG, radius=84, outline=TEAL_DARK, width=4)
+    rounded(draw, (76, 76, 436, 436), fill=PANEL, radius=64, outline=GRID, width=2)
+
+    draw_doc_icon(draw, 108, 118, 146, 188, label="", accent=BLUE)
+    draw_doc_icon(draw, 148, 156, 146, 188, label="", accent=AMBER)
+
+    points = [(186, 360), (246, 304), (296, 236), (366, 176)]
+    branch = [(296, 236), (386, 310)]
+    draw.line(points, fill=TEAL, width=12, joint="curve")
+    draw.line(branch, fill=AMBER, width=8)
+    for x, y in points[:-1]:
+        draw_graph_node(draw, x, y, 18, fill=TEAL)
+    draw_graph_node(draw, *points[-1], 26, fill=WHITE, outline=TEAL)
+    draw_graph_node(draw, *branch[-1], 18, fill=AMBER)
     img.save(ASSETS_DIR / "logo.png")
 
 
@@ -157,21 +197,81 @@ def generate_banner() -> None:
     )
 
     rounded(draw, (900, 126, 1468, 780), fill=PANEL_ALT, radius=28, outline=GRID, width=2)
-    draw.text((940, 168), "What you get", font=font(30, bold=True), fill=WHITE)
-    items = [
-        ("Read-only adoption analysis", "Identify likely plan docs before graph state writes anything."),
-        ("Canonical plan registry", "Track current, historical, superseded, and quarantined docs."),
-        ("Graph queries", "Ask for mainline, lineage, and impact before changing plans."),
-        ("Autonomous upkeep", "Register, refresh, close, supersede, and lint as plans change."),
+    draw.text((940, 168), "From plan files to agent context", font=font(29, bold=True), fill=WHITE)
+    labels = [
+        ("Docs", "plans, closeouts,\ndecisions"),
+        ("Registry", "lifecycle +\nauthority"),
+        ("Graph", "mainline, impact,\ncontext"),
+        ("Agent", "reads the right\nsource of truth"),
     ]
-    y = 226
-    for title, desc in items:
-        draw.ellipse((940, y + 10, 960, y + 30), fill=TEAL)
-        draw.text((978, y), title, font=font(24, bold=True), fill=TEXT)
-        y = write_multiline(draw, (978, y + 34), desc, fill=MUTED, font_obj=font(20), max_width=430, line_gap=8) + 18
+    y = 248
+    for index, (title, desc) in enumerate(labels):
+        x = 950 + (index % 2) * 252
+        if index == 2:
+            y = 494
+        rounded(draw, (x, y, x + 196, y + 138), fill=PANEL, radius=22, outline=GRID, width=2)
+        draw.text((x + 24, y + 22), title, font=font(24, bold=True), fill=TEXT)
+        write_multiline(draw, (x + 24, y + 62), desc, fill=MUTED, font_obj=font(18), max_width=148, line_gap=6)
+    draw_arrow(draw, (1148, 318), (1198, 318), fill=TEAL, width=4)
+    draw_arrow(draw, (1298, 392), (1298, 492), fill=TEAL, width=4)
+    draw_arrow(draw, (1198, 564), (1148, 564), fill=TEAL, width=4)
+    draw.text((950, 704), "The registry stays the source of truth.", font=font(22, bold=True), fill=AMBER)
 
     draw.text((92, 744), "Two entry phrases. Graph-aware upkeep after enablement.", font=font(24, bold=True), fill=AMBER)
     img.save(ASSETS_DIR / "hero-banner.png")
+
+
+def generate_workflow_diagram() -> None:
+    width, height = 1600, 760
+    img = Image.new("RGBA", (width, height), BG)
+    draw = ImageDraw.Draw(img)
+    rounded(draw, (44, 44, width - 44, height - 44), fill=PANEL, radius=36, outline=GRID, width=2)
+    draw.text((84, 82), "How PlanGraph Works", font=font(54, bold=True), fill=WHITE)
+    draw.text((84, 150), "A local, registry-backed planning graph that agents can query before changing plans", font=font(24), fill=MUTED)
+
+    columns = [
+        (92, "Scattered plans", "current plans, old drafts,\ncloseouts, decisions"),
+        (430, "Read-only scan", "find candidates without\nchanging graph state"),
+        (768, "Canonical registry", "lifecycle, authority,\nsupersession links"),
+        (1106, "Agent context", "mainline, lineage,\nimpact, conflicts"),
+    ]
+    top = 246
+    card_w = 270
+    card_h = 260
+    for index, (x, title, desc) in enumerate(columns):
+        rounded(draw, (x, top, x + card_w, top + card_h), fill=PANEL_ALT, radius=26, outline=GRID, width=2)
+        draw.text((x + 28, top + 26), title, font=font(24, bold=True), fill=TEXT)
+        write_multiline(draw, (x + 28, top + 66), desc, fill=MUTED, font_obj=font(18), max_width=210, line_gap=7)
+
+        if index == 0:
+            draw_doc_icon(draw, x + 46, top + 138, 82, 96, label="v1", accent=AMBER)
+            draw_doc_icon(draw, x + 104, top + 118, 82, 96, label="v2", accent=TEAL)
+            draw_doc_icon(draw, x + 160, top + 148, 82, 96, label="log", accent=BLUE)
+        elif index == 1:
+            rounded(draw, (x + 56, top + 138, x + 214, top + 194), fill=BG, radius=18, outline=GRID, width=2)
+            centered_text(draw, (x + 56, top + 138, x + 214, top + 194), "init report", font_obj=font(19, bold=True), fill=TEAL)
+            draw.line((x + 84, top + 218, x + 186, top + 218), fill=AMBER, width=8)
+            draw.line((x + 84, top + 238, x + 152, top + 238), fill=GRID, width=8)
+        elif index == 2:
+            rows = [("active", TEAL), ("closed", BLUE), ("superseded", AMBER)]
+            for offset, (label, color) in enumerate(rows):
+                y = top + 132 + offset * 38
+                draw.ellipse((x + 54, y + 6, x + 72, y + 24), fill=color)
+                draw.text((x + 84, y), label, font=font(18, bold=True), fill=TEXT)
+        else:
+            nodes = [(x + 80, top + 210), (x + 140, top + 154), (x + 202, top + 210), (x + 140, top + 238)]
+            draw.line((nodes[0], nodes[1], nodes[2], nodes[3], nodes[0]), fill=TEAL, width=5)
+            draw.line((nodes[1], nodes[3]), fill=GRID, width=4)
+            for n, color in zip(nodes, [TEAL, WHITE, AMBER, BLUE]):
+                draw_graph_node(draw, n[0], n[1], 16, fill=color, outline=PANEL_ALT)
+
+        if index < len(columns) - 1:
+            draw_arrow(draw, (x + card_w + 16, top + 130), (x + card_w + 68, top + 130), fill=TEAL, width=5)
+
+    rounded(draw, (92, 574, width - 92, 676), fill=BG, radius=24, outline=GRID, width=2)
+    draw.text((132, 606), "Why it matters:", font=font(25, bold=True), fill=AMBER)
+    draw.text((324, 606), "agents stop guessing from chat history and read repo-visible plan state instead.", font=font(25, bold=True), fill=TEXT)
+    img.save(ASSETS_DIR / "how-it-works.png")
 
 
 def read_text(path: Path) -> list[str]:
@@ -283,9 +383,7 @@ def render_registry_table(lines: list[str]) -> None:
         draw.text((columns[4][1], row_y), row[4], font=font(18), fill=TEAL)
         row_y += row_height
 
-    out = ASSETS_DIR / "screenshot-registry.png"
-    img.save(out)
-    img.save(ASSETS_DIR / "screenshot-registry-v2.png")
+    img.save(ASSETS_DIR / "screenshot-registry.png")
 
 
 def generate_report_assets() -> None:
@@ -308,6 +406,7 @@ def main() -> None:
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
     generate_logo()
     generate_banner()
+    generate_workflow_diagram()
     generate_report_assets()
     print("Generated README assets in", ASSETS_DIR)
 
