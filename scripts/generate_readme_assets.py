@@ -122,6 +122,39 @@ def resize_asset(source_name: str, target_name: str, size: tuple[int, int]) -> b
     return True
 
 
+def derive_gpt_hero(source_name: str, target_name: str, size: tuple[int, int]) -> bool:
+    source = ASSETS_DIR / source_name
+    if not source.exists():
+        return False
+    with Image.open(source) as img:
+        img = img.convert("RGBA").resize(size, Image.Resampling.LANCZOS)
+    draw = ImageDraw.Draw(img, "RGBA")
+    labels = [
+        ("Plan docs", 82, 104),
+        ("Registry", 638, 104),
+        ("Plan graph", 1010, 104),
+        ("Agent context", 1270, 104),
+    ]
+    label_font = font(30, bold=True)
+    for text, x, y in labels:
+        tw = int(draw.textlength(text, font=label_font))
+        box = (x, y, x + tw + 42, y + 56)
+        rounded(draw, box, fill=(6, 20, 27, 214), radius=22, outline=TEAL, width=2)
+        draw.text((x + 21, y + 12), text, font=label_font, fill=WHITE)
+
+    draw_arrow(draw, (286, 132), (610, 132), fill=TEAL, width=4)
+    draw_arrow(draw, (790, 132), (982, 132), fill=TEAL, width=4)
+    draw_arrow(draw, (1196, 132), (1244, 132), fill=TEAL, width=4)
+
+    caption = "Scattered plans become repo-visible plan state for AI agents."
+    caption_font = font(31, bold=True)
+    tw = int(draw.textlength(caption, font=caption_font))
+    rounded(draw, (80, 774, 80 + tw + 54, 836), fill=(6, 20, 27, 224), radius=24, outline=GRID, width=2)
+    draw.text((107, 788), caption, font=caption_font, fill=TEXT)
+    img.save(ASSETS_DIR / target_name)
+    return True
+
+
 def centered_text(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], text: str, *, font_obj: ImageFont.FreeTypeFont, fill: str) -> None:
     left, top, right, bottom = box
     bbox = draw.textbbox((0, 0), text, font=font_obj)
@@ -178,7 +211,7 @@ def generate_logo() -> None:
 
 
 def generate_banner() -> None:
-    if resize_asset("hero-banner-gpt-source.png", "hero-banner.png", (1600, 900)):
+    if derive_gpt_hero("hero-banner-gpt-source.png", "hero-banner.png", (1600, 900)):
         return
     img = Image.new("RGBA", (1600, 900), BG)
     draw = ImageDraw.Draw(img)
