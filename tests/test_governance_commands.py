@@ -1,13 +1,23 @@
+import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / 'scripts' / 'plan_governance.py'
+SCRIPT_SPEC = importlib.util.spec_from_file_location('plan_governance_module', SCRIPT_PATH)
+assert SCRIPT_SPEC is not None and SCRIPT_SPEC.loader is not None
+PLAN_GOV = importlib.util.module_from_spec(SCRIPT_SPEC)
+sys.modules[SCRIPT_SPEC.name] = PLAN_GOV
+SCRIPT_SPEC.loader.exec_module(PLAN_GOV)
 
 
 def run_cli(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -17,6 +27,29 @@ def run_cli(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
     )
+
+
+def run_mcp_session(root: Path, *messages: dict[str, object]) -> list[dict[str, object]]:
+    payload = '\n'.join(json.dumps(message) for message in messages) + '\n'
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), 'mcp', '--repo-root', str(root)],
+        input=payload,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def completed_process(args: list[str], returncode: int = 0, stdout: str = '', stderr: str = '') -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(args=args, returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def capture_json_call(func, *args):
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        code = func(*args)
+    return code, json.loads(buffer.getvalue())
 
 
 def init_git_repo(root: Path) -> None:
@@ -67,6 +100,7 @@ def write_minimal_repo_config(root: Path) -> None:
             'scan:',
             '  include_globs:',
             '    - docs/**/*.md',
+            '    - .plangraph/**/*.md',
             '  exclude_globs:',
             'classification:',
             '  high_confidence_threshold: 0.85',
@@ -120,6 +154,611 @@ def row_for_doc(root: Path, doc_path: str) -> dict[str, str]:
 
 
 class GovernanceCommandTests(unittest.TestCase):
+    def test_index_builds_sqlite_status_and_detects_stale_registry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'week1_plan.md').write_text('# Week 1 Plan\n\nSee [decision](decision.md).\n', encoding='utf-8')
+            (docs / 'decision.md').write_text('# Decision\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/week1_plan.md')
+            run_cli(root, 'register', 'docs/decision.md')
+
+            before = run_cli(root, 'status')
+            before_data = json.loads(before.stdout)
+            self.assertFalse(before_data['exists'])
+            self.assertTrue(before_data['stale'])
+
+            indexed = run_cli(root, 'index')
+            indexed_data = json.loads(indexed.stdout)
+            self.assertTrue(indexed_data['exists'])
+            self.assertFalse(indexed_data['stale'])
+            self.assertEqual(indexed_data['schema_version'], '5')
+            self.assertEqual(indexed_data['schema_note'], 'sqlite-like-fallback-for-short-and-cjk-query-terms')
+            self.assertEqual(indexed_data['node_count'], 2)
+            self.assertGreaterEqual(indexed_data['edge_count'], 1)
+            self.assertEqual(indexed_data['unresolved_count'], 0)
+            self.assertTrue((root / '.plangraph' / 'plangraph.db').exists())
+
+            with (docs / 'plan_registry.md').open('a', encoding='utf-8') as fh:
+                fh.write('\n')
+
+            after = run_cli(root, 'status')
+            after_data = json.loads(after.stdout)
+            self.assertTrue(after_data['exists'])
+            self.assertTrue(after_data['stale'])
+            stale_paths = {item['path'] for item in after_data['stale_files']}
+            self.assertIn('docs/plan_registry.md', stale_paths)
+
+    def test_index_directory_does_not_enter_plan_discovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            index_dir = root / '.plangraph'
+            docs.mkdir()
+            index_dir.mkdir()
+            write_minimal_repo_config(root)
+            (index_dir / 'cached_plan.md').write_text('# Cached Plan\n\nThis is generated cache.\n', encoding='utf-8')
+            (docs / 'week1_plan.md').write_text('# Week 1 Plan\n', encoding='utf-8')
+
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            registered_paths = {row['doc_path'] for row in registry_rows(root).values()}
+
+            self.assertIn('docs/week1_plan.md', registered_paths)
+            self.assertNotIn('.plangraph/cached_plan.md', registered_paths)
+
+    def test_init_report_discloses_out_of_scope_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            archive = root / 'archive'
+            docs.mkdir()
+            archive.mkdir()
+            (docs / 'current_plan.md').write_text('# Current Plan\n\n- [ ] Ship the next step.\n', encoding='utf-8')
+            (archive / 'old_plan.md').write_text('# Old Plan\n\nHistorical execution plan.\n', encoding='utf-8')
+
+            run_cli(root, 'init')
+            report = (docs / 'plan_adoption_report.md').read_text(encoding='utf-8')
+
+            self.assertIn('Repository Markdown files found: 2', report)
+            self.assertIn('Markdown files inside configured scan scope: 1', report)
+            self.assertIn('1 Markdown file is outside configured scan scope and was not inspected', report)
+            self.assertIn('## Out-of-Scope Markdown Files', report)
+            self.assertIn('archive/old_plan.md', report)
+
+    def test_index_status_does_not_track_missing_legacy_config_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            (docs / 'plan_registry.md').write_text(
+                '| plan_id | title | doc_path | doc_role | workstream | lifecycle_status | execution_status | authoritative | classification_source | confidence | parent_plan | supersedes | superseded_by | created_at | last_reviewed_at | notes |\n'
+                '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n'
+                '| a | A | docs/a.md | execution_plan | core | active | in_progress | true | manual | 1.00 |  |  |  |  |  |  |\n',
+                encoding='utf-8',
+            )
+            (docs / 'a.md').write_text('# A\n', encoding='utf-8')
+
+            result = run_cli(root, 'index')
+            data = json.loads(result.stdout)
+
+            self.assertFalse(data['stale'])
+            stale_paths = {item['path'] for item in data['stale_files']}
+            self.assertNotIn('.plangraph.yml', stale_paths)
+            self.assertNotIn('.plan-governance.yml', stale_paths)
+
+    def test_sync_rebuilds_stale_sqlite_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'week1_plan.md').write_text('# Week 1 Plan\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/week1_plan.md')
+            run_cli(root, 'index')
+            (docs / 'week1_plan.md').write_text('# Week 1 Plan\n\nUpdated local detail.\n', encoding='utf-8')
+
+            stale = run_cli(root, 'status')
+            stale_data = json.loads(stale.stdout)
+            self.assertTrue(stale_data['stale'])
+
+            synced = run_cli(root, 'sync')
+            synced_data = json.loads(synced.stdout)
+
+            self.assertEqual(synced_data['query'], 'sync')
+            self.assertEqual(synced_data['action'], 'rebuilt')
+            self.assertFalse(synced_data['status']['stale'])
+
+    def test_sync_rebuilds_old_schema_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'week1_plan.md').write_text('# Week 1 Plan\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/week1_plan.md')
+            run_cli(root, 'index')
+
+            db_path = root / '.plangraph' / 'plangraph.db'
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
+
+            stale = run_cli(root, 'status')
+            stale_data = json.loads(stale.stdout)
+            self.assertTrue(stale_data['stale'])
+            self.assertIn('schema version mismatch', '\n'.join(stale_data['errors']))
+
+            synced = run_cli(root, 'sync')
+            synced_data = json.loads(synced.stdout)
+            self.assertEqual(synced_data['action'], 'rebuilt')
+            self.assertEqual(synced_data['status']['schema_version'], '5')
+
+    def test_query_uses_sqlite_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'week1_plan.md').write_text(
+                '# Week 1 Retrieval Plan\n\nThis plan covers retrieval ladder smoke testing.\n',
+                encoding='utf-8',
+            )
+            run_cli(root, 'register', 'docs/week1_plan.md')
+            run_cli(root, 'index')
+
+            result = run_cli(root, 'query', 'retrieval ladder')
+            data = json.loads(result.stdout)
+
+            self.assertEqual(data['query'], 'query')
+            self.assertEqual(data['text'], 'retrieval ladder')
+            self.assertFalse(data['stale'])
+            self.assertEqual(data['match_strategy'], 'fts')
+            self.assertGreaterEqual(data['count'], 1)
+            self.assertEqual(data['results'][0]['doc_path'], 'docs/week1_plan.md')
+            self.assertIn(data['results'][0]['match_source'], {'fts', 'like'})
+
+    def test_query_falls_back_to_like_for_short_cjk_terms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'week1_plan.md').write_text(
+                '# 中文计划\n\n这是中文检索回退测试，用来验证短词查询。\n',
+                encoding='utf-8',
+            )
+            run_cli(root, 'register', 'docs/week1_plan.md')
+            run_cli(root, 'index')
+
+            result = run_cli(root, 'query', '中文')
+            data = json.loads(result.stdout)
+
+            self.assertEqual(data['query'], 'query')
+            self.assertEqual(data['text'], '中文')
+            self.assertFalse(data['stale'])
+            self.assertEqual(data['match_strategy'], 'like')
+            self.assertEqual(data['count'], 1)
+            self.assertEqual(data['results'][0]['doc_path'], 'docs/week1_plan.md')
+            self.assertEqual(data['results'][0]['match_source'], 'like')
+
+    def test_query_refuses_stale_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'week1_plan.md').write_text('# Week 1 Plan\n\nOriginal.\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/week1_plan.md')
+            run_cli(root, 'index')
+            (docs / 'week1_plan.md').write_text('# Week 1 Plan\n\nChanged.\n', encoding='utf-8')
+
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), 'query', 'Changed', '--repo-root', str(root)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            data = json.loads(result.stdout)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(data['stale'])
+            self.assertEqual(data['error'], 'index stale')
+            self.assertIn('sync', data['suggestion'])
+
+    def test_mcp_initialize_tools_and_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'week1_plan.md').write_text('# Week 1 RAG Plan\n\nSearchable body text.\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/week1_plan.md')
+            run_cli(root, 'index')
+
+            messages = run_mcp_session(
+                root,
+                {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}},
+                {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list', 'params': {}},
+                {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {'name': 'plangraph_query', 'arguments': {'text': 'searchable'}}},
+            )
+
+            self.assertEqual(messages[0]['result']['serverInfo']['name'], 'plangraph')
+            self.assertEqual(Path(messages[0]['result']['meta']['workspace_root']), root.resolve())
+            self.assertEqual(messages[0]['result']['meta']['discovery_source'], 'fallback.repo_root')
+            tool_names = {item['name'] for item in messages[1]['result']['tools']}
+            self.assertIn('plangraph_status', tool_names)
+            self.assertIn('plangraph_mainline', tool_names)
+            self.assertIn('plangraph_query', tool_names)
+            self.assertIn('plangraph_lineage', tool_names)
+            self.assertIn('plangraph_impact', tool_names)
+            self.assertIn('plangraph_context', tool_names)
+            self.assertIn('plangraph_conflicts', tool_names)
+            self.assertIn('plangraph_body_links', tool_names)
+            call_payload = json.loads(messages[2]['result']['content'][0]['text'])
+            self.assertEqual(call_payload['query'], 'query')
+            self.assertEqual(call_payload['count'], 1)
+            self.assertEqual(call_payload['results'][0]['doc_path'], 'docs/week1_plan.md')
+
+    def test_mcp_context_tool_returns_aggregated_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'roadmap.md').write_text('# Roadmap\n', encoding='utf-8')
+            (docs / 'week1_plan.md').write_text('# Week 1 Plan\n\nSee [decision](decision.md).\n', encoding='utf-8')
+            (docs / 'decision.md').write_text('# Decision\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/roadmap.md')
+            roadmap_id = row_for_doc(root, 'docs/roadmap.md')['plan_id']
+            rows = registry_rows(root)
+            rows[roadmap_id]['doc_role'] = 'master_plan'
+            rows[roadmap_id]['authoritative'] = 'true'
+            rows[roadmap_id]['notes'] = 'part of current mainline'
+            (docs / 'plan_registry.md').write_text(
+                '| plan_id | title | doc_path | doc_role | workstream | lifecycle_status | execution_status | authoritative | classification_source | confidence | parent_plan | supersedes | superseded_by | created_at | last_reviewed_at | notes |\n'
+                '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n'
+                + '\n'.join(
+                    '| ' + ' | '.join(rows[plan_id][key] for key in [
+                        'plan_id', 'title', 'doc_path', 'doc_role', 'workstream', 'lifecycle_status',
+                        'execution_status', 'authoritative', 'classification_source', 'confidence',
+                        'parent_plan', 'supersedes', 'superseded_by', 'created_at', 'last_reviewed_at', 'notes',
+                    ]) + ' |'
+                    for plan_id in rows
+                ) + '\n',
+                encoding='utf-8',
+            )
+            run_cli(root, 'register', 'docs/week1_plan.md')
+            run_cli(root, 'register', 'docs/decision.md')
+            week1_id = row_for_doc(root, 'docs/week1_plan.md')['plan_id']
+
+            messages = run_mcp_session(
+                root,
+                {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}},
+                {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {'name': 'plangraph_context', 'arguments': {'plan_id': week1_id}}},
+            )
+            payload = json.loads(messages[1]['result']['content'][0]['text'])
+
+            self.assertEqual(payload['query'], 'context')
+            self.assertEqual(payload['plan']['plan_id'], week1_id)
+            self.assertEqual(payload['body_links']['edge_count'], 1)
+            self.assertGreaterEqual(payload['must_read_count'], 2)
+
+    def test_mcp_impact_and_context_support_compact_and_expanded_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'target_plan.md').write_text('# Target Plan\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/target_plan.md')
+            for index in range(12):
+                path = docs / f'peer_{index}_plan.md'
+                path.write_text(f'# Peer {index} Plan\n', encoding='utf-8')
+                run_cli(root, 'register', f'docs/peer_{index}_plan.md')
+            target_id = row_for_doc(root, 'docs/target_plan.md')['plan_id']
+
+            messages = run_mcp_session(
+                root,
+                {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}},
+                {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {'name': 'plangraph_impact', 'arguments': {'plan_id': target_id}}},
+                {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {'name': 'plangraph_impact', 'arguments': {'plan_id': target_id, 'mode': 'expanded'}}},
+                {'jsonrpc': '2.0', 'id': 4, 'method': 'tools/call', 'params': {'name': 'plangraph_context', 'arguments': {'plan_id': target_id}}},
+                {'jsonrpc': '2.0', 'id': 5, 'method': 'tools/call', 'params': {'name': 'plangraph_context', 'arguments': {'plan_id': target_id, 'mode': 'expanded'}}},
+            )
+            compact_impact = json.loads(messages[1]['result']['content'][0]['text'])
+            expanded_impact = json.loads(messages[2]['result']['content'][0]['text'])
+            compact_context = json.loads(messages[3]['result']['content'][0]['text'])
+            expanded_context = json.loads(messages[4]['result']['content'][0]['text'])
+
+            self.assertEqual(compact_impact['mode'], 'compact')
+            self.assertEqual(compact_impact['impact_count'], 8)
+            self.assertGreater(compact_impact['total_impact_count'], compact_impact['impact_count'])
+            self.assertGreater(compact_impact['omitted_impact_count'], 0)
+            self.assertEqual(expanded_impact['mode'], 'expanded')
+            self.assertEqual(expanded_impact['impact_count'], expanded_impact['total_impact_count'])
+            self.assertGreater(expanded_impact['impact_count'], compact_impact['impact_count'])
+
+            self.assertEqual(compact_context['mode'], 'compact')
+            self.assertLessEqual(compact_context['must_read_count'], 8)
+            self.assertGreater(compact_context['total_must_read_count'], compact_context['must_read_count'])
+            self.assertEqual(expanded_context['mode'], 'expanded')
+            self.assertEqual(expanded_context['must_read_count'], expanded_context['total_must_read_count'])
+            self.assertGreater(expanded_context['must_read_count'], compact_context['must_read_count'])
+
+    def test_mcp_initialize_prefers_root_uri_workspace_discovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = workspace / 'repo'
+            docs = root / 'docs'
+            docs.mkdir(parents=True)
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            run_cli(root, 'index')
+
+            messages = run_mcp_session(
+                workspace,
+                {
+                    'jsonrpc': '2.0',
+                    'id': 1,
+                    'method': 'initialize',
+                    'params': {'rootUri': root.as_uri()},
+                },
+            )
+
+            self.assertEqual(Path(messages[0]['result']['meta']['workspace_root']), root.resolve())
+            self.assertEqual(messages[0]['result']['meta']['discovery_source'], 'initialize.rootUri')
+            self.assertTrue(messages[0]['result']['meta']['index_exists'])
+
+    def test_mcp_initialize_discovers_unique_child_governed_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = workspace / 'repo'
+            docs = root / 'docs'
+            docs.mkdir(parents=True)
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            run_cli(root, 'index')
+
+            messages = run_mcp_session(
+                workspace,
+                {
+                    'jsonrpc': '2.0',
+                    'id': 1,
+                    'method': 'initialize',
+                    'params': {'rootUri': workspace.as_uri()},
+                },
+            )
+
+            self.assertEqual(Path(messages[0]['result']['meta']['workspace_root']), root.resolve())
+            self.assertEqual(messages[0]['result']['meta']['discovery_source'], 'initialize.rootUri')
+            self.assertEqual(messages[0]['result']['meta']['discovery_marker'], 'child:.plangraph.yml')
+            self.assertTrue(messages[0]['result']['meta']['index_exists'])
+
+    def test_mcp_initialize_does_not_guess_between_multiple_child_repos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            for name in ['repo-a', 'repo-b']:
+                root = workspace / name
+                (root / 'docs').mkdir(parents=True)
+                write_minimal_repo_config(root)
+                run_cli(root, 'bootstrap', '--skip-install-agents-block')
+
+            messages = run_mcp_session(
+                workspace,
+                {
+                    'jsonrpc': '2.0',
+                    'id': 1,
+                    'method': 'initialize',
+                    'params': {'rootUri': workspace.as_uri()},
+                },
+            )
+
+            self.assertEqual(Path(messages[0]['result']['meta']['workspace_root']), workspace.resolve())
+            self.assertEqual(messages[0]['result']['meta']['discovery_marker'], 'workspace-root')
+            self.assertFalse(messages[0]['result']['meta']['index_exists'])
+
+    def test_mcp_tools_accept_project_path_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = workspace / 'repo'
+            docs = root / 'docs'
+            docs.mkdir(parents=True)
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'roadmap_plan.md').write_text('# Roadmap Plan\n', encoding='utf-8')
+            run_cli(root, 'register', 'docs/roadmap_plan.md')
+            run_cli(root, 'index')
+
+            messages = run_mcp_session(
+                workspace,
+                {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'rootUri': workspace.as_uri()}},
+                {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {'name': 'plangraph_mainline', 'arguments': {'projectPath': str(root)}}},
+                {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {'name': 'plangraph_query', 'arguments': {'repo_root': str(root), 'text': 'Roadmap'}}},
+            )
+            mainline_payload = json.loads(messages[1]['result']['content'][0]['text'])
+            query_payload = json.loads(messages[2]['result']['content'][0]['text'])
+
+            self.assertEqual(mainline_payload['query'], 'mainline')
+            self.assertEqual(mainline_payload['heads'][0]['doc_path'], 'docs/roadmap_plan.md')
+            self.assertEqual(query_payload['query'], 'query')
+            self.assertEqual(query_payload['count'], 1)
+            self.assertEqual(query_payload['results'][0]['doc_path'], 'docs/roadmap_plan.md')
+
+    def test_install_reports_already_configured_codex_mcp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script_path = SCRIPT_PATH.resolve()
+            expected = {
+                'name': 'plangraph',
+                'transport': {
+                    'type': 'stdio',
+                    'command': str(script_path),
+                    'args': ['mcp'],
+                    'env': {},
+                },
+            }
+
+            def fake_run(cmd: list[str], check: bool = False, capture_output: bool = False, text: bool = False, **kwargs: object):
+                if cmd[:4] == ['codex', 'mcp', 'get', 'plangraph']:
+                    return completed_process(cmd, stdout=json.dumps(expected))
+                raise AssertionError(f'unexpected command: {cmd}')
+
+            with patch('subprocess.run', side_effect=fake_run):
+                code, data = capture_json_call(PLAN_GOV.install_mcp_server, root, script_path)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(data['query'], 'install')
+            self.assertFalse(data['changed'])
+            self.assertEqual(data['status'], 'already-configured')
+
+    def test_install_replaces_existing_codex_mcp_and_adds_expected_transport(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected_add = [
+                'codex',
+                'mcp',
+                'add',
+                'plangraph',
+                '--',
+                str(SCRIPT_PATH.resolve()),
+                'mcp',
+            ]
+            calls: list[list[str]] = []
+
+            def fake_run(cmd: list[str], check: bool = False, capture_output: bool = False, text: bool = False, **kwargs: object):
+                calls.append(cmd)
+                if cmd[:4] == ['codex', 'mcp', 'get', 'plangraph']:
+                    return completed_process(
+                        cmd,
+                        stdout=json.dumps({
+                            'name': 'plangraph',
+                            'transport': {
+                                'type': 'stdio',
+                                'command': 'python3',
+                                'args': ['old.py', 'mcp'],
+                                'env': {'PLANGRAPH_REPO_ROOT': '/tmp/elsewhere'},
+                            },
+                        }),
+                    )
+                if cmd[:4] == ['codex', 'mcp', 'remove', 'plangraph']:
+                    return completed_process(cmd)
+                if cmd == expected_add:
+                    return completed_process(cmd)
+                raise AssertionError(f'unexpected command: {cmd}')
+
+            with patch('subprocess.run', side_effect=fake_run):
+                code, data = capture_json_call(PLAN_GOV.install_mcp_server, root, SCRIPT_PATH.resolve())
+
+            self.assertEqual(code, 0)
+            self.assertEqual(data['status'], 'installed')
+            self.assertTrue(data['changed'])
+            self.assertIn(expected_add, calls)
+
+    def test_uninstall_reports_not_installed(self):
+        def fake_run(cmd: list[str], check: bool = False, capture_output: bool = False, text: bool = False, **kwargs: object):
+            if cmd[:4] == ['codex', 'mcp', 'get', 'plangraph']:
+                return completed_process(cmd, returncode=1, stderr="Error: No MCP server named 'plangraph' found.")
+            raise AssertionError(f'unexpected command: {cmd}')
+
+        with patch('subprocess.run', side_effect=fake_run):
+            code, data = capture_json_call(PLAN_GOV.uninstall_mcp_server)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(data['query'], 'uninstall')
+        self.assertFalse(data['changed'])
+        self.assertEqual(data['status'], 'not-installed')
+
+    def test_discover_mcp_reports_expected_transport(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def fake_run(cmd: list[str], check: bool = False, capture_output: bool = False, text: bool = False, **kwargs: object):
+                if cmd[:4] == ['codex', 'mcp', 'get', 'plangraph']:
+                    return completed_process(cmd, returncode=1, stderr="Error: No MCP server named 'plangraph' found.")
+                raise AssertionError(f'unexpected command: {cmd}')
+
+            with patch('subprocess.run', side_effect=fake_run):
+                code, data = capture_json_call(PLAN_GOV.describe_mcp_installation, root, SCRIPT_PATH.resolve())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(data['query'], 'mcp-discover')
+        self.assertFalse(data['configured'])
+        self.assertEqual(data['expected_transport']['command'], str(SCRIPT_PATH.resolve()))
+        self.assertEqual(data['expected_transport']['args'], ['mcp'])
+
+    def test_semantic_edges_are_explicit_soft_hints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'rag_plan_a.md').write_text(
+                '---\nworkstream: retrieval-a\n---\n# RAG Retrieval Plan A\n\nretrieval ladder rerank corpus evaluation alpha beta gamma.\n',
+                encoding='utf-8',
+            )
+            (docs / 'rag_plan_b.md').write_text(
+                '---\nworkstream: retrieval-b\n---\n# RAG Retrieval Plan B\n\nretrieval ladder rerank corpus evaluation alpha beta delta.\n',
+                encoding='utf-8',
+            )
+            run_cli(root, 'register', 'docs/rag_plan_a.md')
+            run_cli(root, 'register', 'docs/rag_plan_b.md')
+
+            indexed = run_cli(root, 'index')
+            indexed_data = json.loads(indexed.stdout)
+            self.assertEqual(indexed_data['schema_version'], '5')
+            self.assertEqual(indexed_data['semantic_edge_count'], 0)
+
+            semantic = run_cli(root, 'semantic')
+            semantic_data = json.loads(semantic.stdout)
+            self.assertTrue(semantic_data['enabled'])
+            self.assertGreaterEqual(semantic_data['semantic_edge_count'], 1)
+            self.assertEqual(semantic_data['provenance'], 'semantic-inferred')
+
+            query = run_cli(root, 'query', 'retrieval')
+            query_data = json.loads(query.stdout)
+            self.assertNotIn('semantic_results', query_data)
+            self.assertNotIn('semantic_count', query_data)
+
+            self.assertGreaterEqual(semantic_data['semantic_edge_count'], 1)
+            self.assertEqual(semantic_data['semantic_results'][0]['kind'], 'semantic_overlap')
+            self.assertEqual(semantic_data['semantic_results'][0]['provenance'], 'semantic-inferred')
+            self.assertEqual(semantic_data['semantic_results'][0]['relation_scope'], 'registry-zero-relation')
+
+    def test_semantic_edges_ignore_same_workstream_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            write_minimal_repo_config(root)
+            run_cli(root, 'bootstrap', '--skip-install-agents-block')
+            (docs / 'rag_plan_a.md').write_text(
+                '---\nworkstream: retrieval\n---\n# RAG Retrieval Plan A\n\nretrieval ladder rerank corpus evaluation alpha beta gamma.\n',
+                encoding='utf-8',
+            )
+            (docs / 'rag_plan_b.md').write_text(
+                '---\nworkstream: retrieval\n---\n# RAG Retrieval Plan B\n\nretrieval ladder rerank corpus evaluation alpha beta delta.\n',
+                encoding='utf-8',
+            )
+            run_cli(root, 'register', 'docs/rag_plan_a.md')
+            run_cli(root, 'register', 'docs/rag_plan_b.md')
+
+            semantic = run_cli(root, 'semantic')
+            semantic_data = json.loads(semantic.stdout)
+
+            self.assertEqual(semantic_data['semantic_edge_count'], 0)
+            self.assertEqual(semantic_data['semantic_results'], [])
+
     def test_register_close_and_supersede_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -9,11 +9,14 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 try:
     import yaml
@@ -30,6 +33,37 @@ DEFAULT_ADOPTION_REPORT_PATH = 'docs/plan_adoption_report.md'
 DEFAULT_EXTERNAL_IMPORT_DIR = 'docs/references/external'
 CONFIG_PATH = '.plangraph.yml'
 IGNORE_PATH = '.plangraph.ignore'
+INDEX_DIR = '.plangraph'
+INDEX_DB_PATH = '.plangraph/plangraph.db'
+INDEX_SCHEMA_VERSION = 5
+INDEX_SCHEMA_NOTE = 'sqlite-like-fallback-for-short-and-cjk-query-terms'
+DEFAULT_COMPACT_RESULT_LIMIT = 8
+MCP_PROTOCOL_VERSION = '2025-11-25'
+DEFAULT_MCP_SERVER_NAME = 'plangraph'
+MCP_DISCOVERY_OVERRIDE_ENV_VARS = [
+    'PLANGRAPH_REPO_ROOT',
+    'CODEX_PROJECT_ROOT',
+    'CODEX_WORKSPACE_ROOT',
+]
+MCP_DISCOVERY_WEAK_ENV_VARS = [
+    'PWD',
+]
+MCP_DISCOVERY_MODE = 'initialize-rootUri-with-unique-child-and-tool-override'
+MCP_REPO_ARGUMENT_KEYS = [
+    'projectPath',
+    'project_path',
+    'repoRoot',
+    'repo_root',
+]
+DISCOVERY_EXCLUDED_DIRS = {
+    '.git',
+    '.hg',
+    '.svn',
+    '.venv',
+    'venv',
+    'node_modules',
+    '__pycache__',
+}
 LEGACY_CONFIG_PATH = '.plan-governance.yml'
 LEGACY_IGNORE_PATH = '.plan-governance.ignore'
 AGENTS_BLOCK_START = '<!-- PLANGRAPH START -->'
@@ -219,6 +253,123 @@ def parse_simple_yaml_scalar(value: str) -> Any:
             return value
 
 
+def file_uri_to_path(value: str) -> Path | None:
+    if not value.startswith('file://'):
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme != 'file':
+        return None
+    path = unquote(parsed.path or '')
+    if not path:
+        return None
+    return Path(path)
+
+
+def candidate_workspace_path(value: Any) -> Path | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    path = file_uri_to_path(text)
+    if path is not None:
+        return path
+    return Path(os.path.expanduser(text))
+
+
+def discover_repo_root(candidate: Path) -> tuple[Path, str]:
+    workspace_root = candidate.expanduser().resolve()
+    current = workspace_root if workspace_root.is_dir() else workspace_root.parent
+    for probe in [current, *current.parents]:
+        if (probe / CONFIG_PATH).exists():
+            return probe, CONFIG_PATH
+        if (probe / LEGACY_CONFIG_PATH).exists():
+            return probe, LEGACY_CONFIG_PATH
+        if (probe / 'docs' / 'plan_registry.md').exists():
+            return probe, 'docs/plan_registry.md'
+    child_repo = discover_unique_child_repo_root(current)
+    if child_repo is not None:
+        return child_repo
+    return current, 'workspace-root'
+
+
+def discover_unique_child_repo_root(root: Path) -> tuple[Path, str] | None:
+    if not root.exists() or not root.is_dir():
+        return None
+    matches: list[tuple[int, Path, str]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in DISCOVERY_EXCLUDED_DIRS
+            and not name.endswith('.app')
+        ]
+        path = Path(dirpath)
+        marker = ''
+        if CONFIG_PATH in filenames:
+            marker = CONFIG_PATH
+        elif LEGACY_CONFIG_PATH in filenames:
+            marker = LEGACY_CONFIG_PATH
+        elif 'docs' in dirnames and (path / 'docs' / 'plan_registry.md').exists():
+            marker = 'docs/plan_registry.md'
+        if marker:
+            try:
+                depth = len(path.relative_to(root).parts)
+            except ValueError:
+                depth = 0
+            matches.append((depth, path.resolve(), marker))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (item[0], item[1].as_posix()))
+    nearest_depth = matches[0][0]
+    nearest = [item for item in matches if item[0] == nearest_depth]
+    if len(nearest) == 1:
+        _, path, marker = nearest[0]
+        return path, f'child:{marker}'
+    return None
+
+
+def resolve_mcp_repo_root(params: dict[str, Any] | None, fallback_repo_root: Path) -> tuple[Path, str, str]:
+    params = params or {}
+    candidates: list[tuple[str, Path | None]] = []
+    for key in ['rootUri', 'root_uri', 'repoRoot', 'repo_root', 'workspaceRoot', 'workspace_root', 'cwd']:
+        candidates.append((f'initialize.{key}', candidate_workspace_path(params.get(key))))
+    for key in ['workspaceFolders', 'workspace_folders']:
+        value = params.get(key)
+        if not isinstance(value, list):
+            continue
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                continue
+            candidates.append((f'initialize.{key}[{index}].uri', candidate_workspace_path(item.get('uri'))))
+            candidates.append((f'initialize.{key}[{index}].path', candidate_workspace_path(item.get('path'))))
+    for env_key in MCP_DISCOVERY_OVERRIDE_ENV_VARS:
+        candidates.append((f'env.{env_key}', candidate_workspace_path(os.environ.get(env_key))))
+    candidates.append(('fallback.repo_root', fallback_repo_root))
+    for env_key in MCP_DISCOVERY_WEAK_ENV_VARS:
+        candidates.append((f'env.{env_key}', candidate_workspace_path(os.environ.get(env_key))))
+    for source, path in candidates:
+        if path is None:
+            continue
+        repo_root, marker = discover_repo_root(path)
+        return repo_root, source, marker
+    repo_root, marker = discover_repo_root(fallback_repo_root)
+    return repo_root, 'fallback.repo_root', marker
+
+
+def resolve_mcp_tool_repo_root(
+    arguments: dict[str, Any],
+    active_repo_root: Path,
+    active_cfg: dict[str, Any],
+) -> tuple[Path, dict[str, Any], str, str]:
+    for key in MCP_REPO_ARGUMENT_KEYS:
+        candidate = candidate_workspace_path(arguments.get(key))
+        if candidate is None:
+            continue
+        repo_root, marker = discover_repo_root(candidate)
+        return repo_root, load_effective_config(repo_root), f'arguments.{key}', marker
+    return active_repo_root, active_cfg, 'session.workspace_root', 'active'
+
+
 def dump_simple_yaml(data: Any, indent: int = 0) -> str:
     prefix = ' ' * indent
     if isinstance(data, dict):
@@ -312,9 +463,37 @@ def should_ignore(rel_path: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(rel_path, p) for p in patterns)
 
 
+GLOBAL_MARKDOWN_EXCLUDE_DIRS = {'.git', 'node_modules', INDEX_DIR}
+
+
+def globally_excluded_markdown_path(path: Path, repo_root: Path) -> bool:
+    rel_parts = path.relative_to(repo_root).parts
+    return any(part in GLOBAL_MARKDOWN_EXCLUDE_DIRS for part in rel_parts)
+
+
+def discover_repo_markdown_files(repo_root: Path) -> list[str]:
+    found = [
+        path.relative_to(repo_root).as_posix()
+        for path in repo_root.rglob('*.md')
+        if path.is_file() and not globally_excluded_markdown_path(path, repo_root)
+    ]
+    return sorted(found)
+
+
+def discover_included_markdown_files(repo_root: Path, cfg: dict[str, Any]) -> list[str]:
+    include_globs = cfg.get('scan', {}).get('include_globs', ['*.md', 'docs/**/*.md'])
+    found: set[str] = set()
+    for pattern in include_globs:
+        for path in repo_root.glob(pattern):
+            if path.is_file() and not globally_excluded_markdown_path(path, repo_root):
+                found.add(path.relative_to(repo_root).as_posix())
+    return sorted(found)
+
+
 def discover_candidates(repo_root: Path, cfg: dict[str, Any]) -> list[Candidate]:
     include_globs = cfg.get('scan', {}).get('include_globs', ['*.md', 'docs/**/*.md'])
-    exclude_globs = cfg.get('scan', {}).get('exclude_globs', [])
+    exclude_globs = list(cfg.get('scan', {}).get('exclude_globs', []) or [])
+    exclude_globs.append(f'{INDEX_DIR}/**')
     ignore_patterns = read_ignore_patterns(repo_root)
     found: dict[str, Candidate] = {}
     for pattern in include_globs:
@@ -334,11 +513,19 @@ def discover_candidates(repo_root: Path, cfg: dict[str, Any]) -> list[Candidate]
 
 def discover_markdown_files(repo_root: Path, cfg: dict[str, Any]) -> list[str]:
     include_globs = cfg.get('scan', {}).get('include_globs', ['*.md', 'docs/**/*.md'])
+    exclude_globs = list(cfg.get('scan', {}).get('exclude_globs', []) or [])
+    exclude_globs.append(f'{INDEX_DIR}/**')
+    ignore_patterns = read_ignore_patterns(repo_root)
     found: set[str] = set()
     for pattern in include_globs:
         for path in repo_root.glob(pattern):
             if path.is_file():
-                found.add(path.relative_to(repo_root).as_posix())
+                rel_path = path.relative_to(repo_root).as_posix()
+                if any(fnmatch.fnmatch(rel_path, p) for p in exclude_globs):
+                    continue
+                if should_ignore(rel_path, ignore_patterns):
+                    continue
+                found.add(rel_path)
     return sorted(found)
 
 
@@ -950,12 +1137,21 @@ def plan_id_for(candidate: Candidate) -> str:
     return f'{stem[:24]}-{digest}'
 
 
-def classify_for_init(repo_root: Path, cfg: dict[str, Any]) -> tuple[list[Candidate], list[str]]:
+def classify_for_init(repo_root: Path, cfg: dict[str, Any]) -> tuple[list[Candidate], list[str], dict[str, Any]]:
+    repo_markdown = discover_repo_markdown_files(repo_root)
+    included_markdown = discover_included_markdown_files(repo_root, cfg)
     all_markdown = discover_markdown_files(repo_root, cfg)
     discovered = {candidate.rel_path for candidate in discover_candidates(repo_root, cfg)}
-    ignored = [path for path in all_markdown if path not in discovered and Path(path).name not in DERIVED_DOC_NAMES]
+    ignored = [path for path in included_markdown if path not in discovered]
+    out_of_scope = [path for path in repo_markdown if path not in set(included_markdown)]
     classified = [classify_candidate(c, cfg) for c in discover_candidates(repo_root, cfg)]
-    return classified, ignored
+    scan_summary = {
+        'repo_markdown_count': len(repo_markdown),
+        'included_markdown_count': len(included_markdown),
+        'scanned_markdown_count': len(all_markdown),
+        'out_of_scope': out_of_scope,
+    }
+    return classified, ignored, scan_summary
 
 
 def role_label(role: str) -> str:
@@ -1021,12 +1217,23 @@ def render_conflict_section(candidates: list[Candidate], high_threshold: float) 
     return lines
 
 
-def write_adoption_report(repo_root: Path, cfg: dict[str, Any], classified: list[Candidate], ignored: list[str]) -> Path:
+def markdown_file_sentence(count: int) -> str:
+    return f'{count} Markdown file' if count == 1 else f'{count} Markdown files'
+
+
+def write_adoption_report(
+    repo_root: Path,
+    cfg: dict[str, Any],
+    classified: list[Candidate],
+    ignored: list[str],
+    scan_summary: dict[str, Any],
+) -> Path:
     high_threshold = cfg.get('classification', {}).get('high_confidence_threshold', 0.85)
     quarantine_threshold = cfg.get('classification', {}).get('quarantine_threshold', 0.55)
     high = [c for c in classified if c.confidence >= high_threshold]
     medium = [c for c in classified if quarantine_threshold <= c.confidence < high_threshold]
     low = [c for c in classified if c.confidence < quarantine_threshold]
+    out_of_scope = list(scan_summary.get('out_of_scope', []))
     report_path = repo_root / cfg.get('adoption_report_path', DEFAULT_ADOPTION_REPORT_PATH)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = [
@@ -1038,17 +1245,21 @@ def write_adoption_report(repo_root: Path, cfg: dict[str, Any], classified: list
         '',
         '## Quick Answer',
         '',
-        f'- Found {len(classified)} possible plan-related Markdown files.',
+        f'- Repository Markdown files found: {scan_summary.get("repo_markdown_count", len(classified))}.',
+        f'- Markdown files inside configured scan scope: {scan_summary.get("included_markdown_count", len(classified))}.',
+        f'- Found {len(classified)} possible plan-related Markdown files inside scan scope.',
         f'- {len(high)} look strong enough to auto-register after you review them.',
         f'- {len(medium)} need human confirmation before entering the registry.',
         f'- {len(low)} were weak matches and should usually stay out unless you know they matter.',
-        f'- {len(ignored)} Markdown files were skipped before classification because of scan filters, ignore rules, or derived-document rules.',
+        f'- {markdown_file_sentence(len(ignored))} inside scan scope were skipped before classification because of scanner filters, ignore rules, or derived-document rules.',
+        f'- {markdown_file_sentence(len(out_of_scope))} {"is" if len(out_of_scope) == 1 else "are"} outside configured scan scope and {"was" if len(out_of_scope) == 1 else "were"} not inspected.',
         '',
         '## How To Read This Report',
         '',
         '- "Likely auto-register" means: this file looks enough like a plan that `bootstrap` would probably add it to the registry.',
         '- "Quarantine" means: this file might matter, but a person should check it first.',
         '- "Weak match" means: the file only showed a few planning signals and usually should stay outside governance.',
+        '- "Outside scan scope" means: the file did not match `scan.include_globs`; it was not classified at all.',
         '- Confidence is only a hint, not a decision. A high score does not prove that a file is current.',
         '',
         '## What This Means',
@@ -1094,7 +1305,20 @@ def write_adoption_report(repo_root: Path, cfg: dict[str, Any], classified: list
             lines.append(f'- ... {len(ignored) - 100} more skipped files omitted')
         lines.append('')
     else:
-        lines.extend(['No Markdown files were skipped by the scanner.', ''])
+        lines.extend(['No in-scope Markdown files were skipped by scanner filters.', ''])
+    lines.extend([
+        '## Out-of-Scope Markdown Files',
+        '',
+        'These files did not match `scan.include_globs` and were not inspected. Extend `.plangraph.yml` only if they should participate in planning governance.',
+        '',
+    ])
+    if out_of_scope:
+        lines.extend([f'- `{path}`' for path in out_of_scope[:100]])
+        if len(out_of_scope) > 100:
+            lines.append(f'- ... {len(out_of_scope) - 100} more out-of-scope files omitted')
+        lines.append('')
+    else:
+        lines.extend(['No Markdown files were outside the configured scan scope.', ''])
     lines.extend([
         '## Suggested Configuration',
         '',
@@ -1117,8 +1341,8 @@ def write_adoption_report(repo_root: Path, cfg: dict[str, Any], classified: list
 
 def run_init(repo_root: Path) -> None:
     cfg = load_effective_config(repo_root)
-    classified, ignored = classify_for_init(repo_root, cfg)
-    report_path = write_adoption_report(repo_root, cfg, classified, ignored)
+    classified, ignored, scan_summary = classify_for_init(repo_root, cfg)
+    report_path = write_adoption_report(repo_root, cfg, classified, ignored, scan_summary)
     print(f'init complete: wrote read-only adoption report to {report_path.relative_to(repo_root).as_posix()}')
     print('No registry, quarantine, or project config files were created or modified.')
     print('Next step: read the report, decide which files are current, and run bootstrap only after you agree with the scan.')
@@ -1363,7 +1587,7 @@ class PlanGraph:
             'provenance': 'registry-derived',
         }
 
-    def impact(self, plan_id: str) -> dict[str, Any]:
+    def impact(self, plan_id: str, mode: str = 'compact') -> dict[str, Any]:
         row = self.by_id.get(plan_id)
         if not row:
             return {'error': f'plan_id not found: {plan_id}', 'plan_id': plan_id}
@@ -1391,12 +1615,150 @@ class PlanGraph:
         for peer_id in self.workstream_index.get(row.get('workstream', '') or 'general', []):
             add(peer_id, 'same workstream', 'registry-derived')
 
+        all_impacted = sorted(
+            impacted.values(),
+            key=lambda item: (self.impact_priority(item), item['plan'].get('doc_path', '')),
+        )
+        expanded = mode == 'expanded'
+        displayed = all_impacted if expanded else all_impacted[:DEFAULT_COMPACT_RESULT_LIMIT]
         return {
             'query': 'impact',
+            'mode': 'expanded' if expanded else 'compact',
             'plan': row_summary(row),
-            'impacted': list(impacted.values()),
+            'impacted': displayed,
+            'impact_count': len(displayed),
+            'total_impact_count': len(all_impacted),
+            'omitted_impact_count': max(0, len(all_impacted) - len(displayed)),
             'provenance': 'registry-derived',
         }
+
+    def impact_priority(self, item: dict[str, Any]) -> int:
+        reasons = {reason.get('reason', '') for reason in item.get('reasons', [])}
+        plan = item.get('plan', {})
+        if any(reason != 'same workstream' for reason in reasons):
+            return 0
+        if plan.get('lifecycle_status') == 'active' and plan.get('doc_role') in {'master_plan', 'execution_plan'}:
+            return 1
+        if plan.get('lifecycle_status') == 'active':
+            return 2
+        return 3
+
+    def context(self, plan_id: str, mode: str = 'compact') -> dict[str, Any]:
+        row = self.by_id.get(plan_id)
+        if not row:
+            return {'error': f'plan_id not found: {plan_id}', 'plan_id': plan_id, 'query': 'context'}
+
+        expanded = mode == 'expanded'
+        mainline = self.mainline(row.get('workstream') or None)
+        lineage = self.lineage(plan_id)
+        impact = self.impact(plan_id, mode='expanded' if expanded else 'compact')
+        conflicts = self.conflicts()
+        body_links = self.body_links(plan_id)
+
+        relevant_conflicts = []
+        for item in conflicts.get('conflicts', []):
+            plan_ids = {plan.get('plan_id', '') for plan in item.get('plans', [])}
+            if plan_id in plan_ids:
+                relevant_conflicts.append(item)
+
+        must_read: dict[str, dict[str, Any]] = {}
+
+        def add_must_read(target_row: dict[str, str] | None, reason: str, provenance: str = 'registry-derived') -> None:
+            if not target_row:
+                return
+            doc_path = target_row.get('doc_path', '')
+            if not doc_path:
+                return
+            entry = must_read.setdefault(doc_path, {
+                'plan': row_summary(target_row),
+                'doc_path': doc_path,
+                'reasons': [],
+            })
+            if reason not in entry['reasons']:
+                entry['reasons'].append(reason)
+            entry['provenance'] = provenance
+
+        add_must_read(row, 'selected-plan')
+
+        parent_id = row.get('parent_plan', '').strip()
+        if parent_id:
+            add_must_read(self.by_id.get(parent_id), 'parent-plan')
+
+        for item in lineage.get('backward', []):
+            add_must_read(self.by_id.get(item.get('plan_id', '')), 'superseded-predecessor')
+        for item in lineage.get('forward', []):
+            add_must_read(self.by_id.get(item.get('plan_id', '')), 'superseding-successor')
+
+        for item in impact.get('impacted', []):
+            target = item.get('plan', {})
+            target_row = self.by_id.get(target.get('plan_id', ''))
+            if not target_row:
+                continue
+            for reason in item.get('reasons', []):
+                reason_text = str(reason.get('reason', '')).strip().replace(' ', '-')
+                add_must_read(target_row, reason_text, reason.get('provenance', 'registry-derived'))
+
+        for item in body_links.get('edges', []):
+            add_must_read(self.by_id.get(item.get('target', '')), 'body-linked-doc', item.get('provenance', 'body-link'))
+
+        mainline_heads = []
+        for head in mainline.get('heads', []):
+            head_row = self.by_id.get(head.get('plan_id', ''))
+            if head_row:
+                mainline_heads.append(row_summary(head_row))
+                if head.get('plan_id') != plan_id:
+                    add_must_read(head_row, 'current-mainline-head')
+
+        all_must_read = sorted(must_read.values(), key=self.must_read_sort_key)
+        displayed_must_read = all_must_read if expanded else all_must_read[:DEFAULT_COMPACT_RESULT_LIMIT]
+        result = {
+            'query': 'context',
+            'mode': 'expanded' if expanded else 'compact',
+            'plan': row_summary(row),
+            'mainline': {
+                'workstream': mainline.get('workstream', ''),
+                'execution_policy': mainline.get('execution_policy', ''),
+                'derivation': mainline.get('derivation', ''),
+                'heads': mainline_heads,
+                'notes': mainline.get('notes', ''),
+                'provenance': mainline.get('provenance', 'registry-derived'),
+            },
+            'lineage': lineage,
+            'impact': impact,
+            'conflicts': {
+                'query': 'conflicts',
+                'count': len(relevant_conflicts),
+                'conflicts': relevant_conflicts,
+                'provenance': 'registry-derived',
+            },
+            'body_links': body_links,
+            'must_read': displayed_must_read,
+            'must_read_count': len(displayed_must_read),
+            'total_must_read_count': len(all_must_read),
+            'omitted_must_read_count': max(0, len(all_must_read) - len(displayed_must_read)),
+            'notes': [
+                'Context is deterministic and registry-driven.',
+                'Default mode is compact; pass mode=expanded when a caller needs the full related set.',
+                'It aggregates mainline, lineage, impact, conflicts, and explicit body-link evidence for one plan.',
+                'It does not include semantic soft edges.',
+            ],
+            'provenance': 'registry-derived',
+        }
+        return result
+
+    def must_read_sort_key(self, item: dict[str, Any]) -> tuple[int, str]:
+        reasons = set(item.get('reasons', []))
+        if 'selected-plan' in reasons:
+            priority = 0
+        elif reasons & {'parent-plan', 'superseded-predecessor', 'superseding-successor', 'body-linked-doc'}:
+            priority = 1
+        elif 'current-mainline-head' in reasons:
+            priority = 2
+        elif reasons - {'same-workstream'}:
+            priority = 3
+        else:
+            priority = 4
+        return (priority, item.get('doc_path', ''))
 
     def body_links(self, plan_id: str | None = None) -> dict[str, Any]:
         if self.repo_root is None:
@@ -1536,6 +1898,23 @@ class PlanGraph:
                     rows,
                 )
 
+        if infer_execution_policy(self.rows, self.cfg) == 'strict_mainline':
+            active_execution_heads: dict[str, list[dict[str, str]]] = {}
+            for row in self.rows:
+                if (
+                    row.get('doc_role') == 'execution_plan'
+                    and row.get('lifecycle_status') == 'active'
+                    and not csv_ids(row.get('superseded_by', ''))
+                ):
+                    active_execution_heads.setdefault(row.get('workstream', '') or 'general', []).append(row)
+            for workstream, rows in sorted(active_execution_heads.items()):
+                if len(rows) > 1:
+                    add_conflict(
+                        'multiple-active-execution-heads-in-strict-mainline',
+                        f'strict_mainline has multiple active execution heads in workstream {workstream}; pin or close/supersede until one current head remains',
+                        rows,
+                    )
+
         non_active_parent_statuses = {'closed', 'superseded', 'rejected', 'archived', 'deferred'}
         for row in self.rows:
             if row.get('lifecycle_status') != 'active':
@@ -1640,9 +2019,995 @@ def load_graph(repo_root: Path, cfg: dict[str, Any]) -> PlanGraph | None:
     return PlanGraph(rows, cfg, repo_root=repo_root)
 
 
-def run_graph(repo_root: Path, cfg: dict[str, Any], ids: list[str], workstream: str | None = None) -> int:
+def index_db_path(repo_root: Path, cfg: dict[str, Any]) -> Path:
+    return repo_root / cfg.get('index_path', INDEX_DB_PATH)
+
+
+def file_fingerprint(repo_root: Path, rel_path: str) -> dict[str, Any]:
+    path = repo_root / rel_path
+    if not path.exists() or not path.is_file():
+        return {
+            'path': rel_path,
+            'exists': 0,
+            'sha256': '',
+            'mtime_ns': 0,
+            'size': 0,
+        }
+    stat = path.stat()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {
+        'path': rel_path,
+        'exists': 1,
+        'sha256': digest,
+        'mtime_ns': stat.st_mtime_ns,
+        'size': stat.st_size,
+    }
+
+
+def tracked_index_paths(repo_root: Path, cfg: dict[str, Any], rows: list[dict[str, str]]) -> list[str]:
+    paths: set[str] = {cfg.get('registry_path', 'docs/plan_registry.md')}
+    for candidate in [CONFIG_PATH, LEGACY_CONFIG_PATH]:
+        if (repo_root / candidate).exists():
+            paths.add(candidate)
+            break
+    for candidate in [IGNORE_PATH, LEGACY_IGNORE_PATH]:
+        if (repo_root / candidate).exists():
+            paths.add(candidate)
+            break
+    for row in rows:
+        doc_path = row.get('doc_path', '').strip()
+        if doc_path:
+            paths.add(doc_path)
+    return sorted(paths)
+
+
+def current_index_fingerprints(repo_root: Path, cfg: dict[str, Any], rows: list[dict[str, str]]) -> dict[str, dict[str, Any]]:
+    return {
+        rel_path: file_fingerprint(repo_root, rel_path)
+        for rel_path in tracked_index_paths(repo_root, cfg, rows)
+    }
+
+
+def registry_edges(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+    by_id = registry_plan_map(rows)
+    edges: list[dict[str, Any]] = []
+
+    def add(source: str, target: str, kind: str, row: dict[str, str], provenance: str = 'registry-direct') -> None:
+        if not source or not target:
+            return
+        target_row = by_id.get(target, {})
+        edges.append({
+            'source': source,
+            'target': target,
+            'kind': kind,
+            'provenance': provenance,
+            'source_doc_path': row.get('doc_path', ''),
+            'target_doc_path': target_row.get('doc_path', ''),
+            'line': 0,
+            'label': '',
+        })
+
+    for row in rows:
+        plan_id = row.get('plan_id', '')
+        for target in csv_ids(row.get('supersedes', '')):
+            add(plan_id, target, 'supersedes', row)
+        for target in csv_ids(row.get('superseded_by', '')):
+            add(plan_id, target, 'superseded_by', row)
+        parent = row.get('parent_plan', '').strip()
+        if parent:
+            add(plan_id, parent, 'child_of', row)
+            if parent in by_id:
+                add(parent, plan_id, 'parent_of', by_id[parent])
+        workstream = row.get('workstream', '').strip()
+        if workstream:
+            edges.append({
+                'source': plan_id,
+                'target': workstream,
+                'kind': 'part_of_workstream',
+                'provenance': 'registry-derived',
+                'source_doc_path': row.get('doc_path', ''),
+                'target_doc_path': '',
+                'line': 0,
+                'label': '',
+            })
+    return edges
+
+
+SEMANTIC_STOPWORDS = {
+    'the', 'and', 'for', 'with', 'from', 'that', 'this', 'plan', 'docs', 'doc',
+    '方案', '计划', '执行', '清单', '文档', '项目', '开发', '阶段', '当前',
+}
+
+
+def semantic_tokens(text: str) -> set[str]:
+    tokens = {
+        token.lower()
+        for token in re.findall(r'[A-Za-z0-9_]{3,}|[\u4e00-\u9fff]{2,}', text)
+    }
+    return {token for token in tokens if token not in SEMANTIC_STOPWORDS}
+
+
+def semantic_enabled(cfg: dict[str, Any]) -> bool:
+    return bool(cfg.get('semantic', {}).get('enabled', False))
+
+
+def semantic_threshold(cfg: dict[str, Any]) -> float:
+    return float(cfg.get('semantic', {}).get('overlap_threshold', 0.35))
+
+
+def semantic_hard_relation_pairs(rows: list[dict[str, str]]) -> set[tuple[str, str]]:
+    pairs: set[tuple[str, str]] = set()
+    for item in registry_edges(rows):
+        if item.get('kind') == 'part_of_workstream':
+            continue
+        source = item.get('source', '')
+        target = item.get('target', '')
+        if source and target:
+            pairs.add((source, target))
+            pairs.add((target, source))
+    return pairs
+
+
+def semantic_edges_for_rows(repo_root: Path, cfg: dict[str, Any], rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+    threshold = semantic_threshold(cfg)
+    hard_relation_pairs = semantic_hard_relation_pairs(rows)
+    indexed: list[dict[str, Any]] = []
+    for row in rows:
+        doc_path = repo_root / row.get('doc_path', '')
+        body = doc_body(doc_path.read_text(encoding='utf-8', errors='ignore')) if doc_path.is_file() else ''
+        tokens = semantic_tokens(' '.join([row.get('title', ''), row.get('doc_path', ''), row.get('notes', ''), body]))
+        if len(tokens) < 3:
+            continue
+        indexed.append({'row': row, 'tokens': tokens})
+
+    edges: list[dict[str, Any]] = []
+    for i, source in enumerate(indexed):
+        for target in indexed[i + 1:]:
+            overlap = source['tokens'] & target['tokens']
+            denominator = min(len(source['tokens']), len(target['tokens']))
+            confidence = len(overlap) / denominator if denominator else 0.0
+            if confidence < threshold:
+                continue
+            source_row = source['row']
+            target_row = target['row']
+            source_id = source_row.get('plan_id', '')
+            target_id = target_row.get('plan_id', '')
+            if (source_id, target_id) in hard_relation_pairs:
+                continue
+            source_workstream = source_row.get('workstream', '').strip()
+            target_workstream = target_row.get('workstream', '').strip()
+            if not source_workstream or not target_workstream or source_workstream == target_workstream:
+                continue
+            shared_terms = sorted(overlap)[:12]
+            edges.append({
+                'source': source_id,
+                'target': target_id,
+                'kind': 'semantic_overlap',
+                'provenance': 'semantic-inferred',
+                'relation_scope': 'registry-zero-relation',
+                'confidence': f'{confidence:.2f}',
+                'source_doc_path': source_row.get('doc_path', ''),
+                'target_doc_path': target_row.get('doc_path', ''),
+                'shared_terms': ','.join(shared_terms),
+            })
+    return edges
+
+
+def ensure_index_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        '''
+        DROP TABLE IF EXISTS metadata;
+        DROP TABLE IF EXISTS nodes;
+        DROP TABLE IF EXISTS edges;
+        DROP TABLE IF EXISTS files;
+        DROP TABLE IF EXISTS unresolved_refs;
+        DROP TABLE IF EXISTS external_refs;
+        DROP TABLE IF EXISTS node_fts;
+        DROP TABLE IF EXISTS semantic_edges;
+
+        CREATE TABLE metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE nodes (
+            plan_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            doc_path TEXT NOT NULL,
+            doc_role TEXT NOT NULL,
+            workstream TEXT NOT NULL,
+            lifecycle_status TEXT NOT NULL,
+            execution_status TEXT NOT NULL,
+            authoritative TEXT NOT NULL,
+            classification_source TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            parent_plan TEXT NOT NULL,
+            supersedes TEXT NOT NULL,
+            superseded_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_reviewed_at TEXT NOT NULL,
+            notes TEXT NOT NULL
+        );
+
+        CREATE TABLE edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            provenance TEXT NOT NULL,
+            source_doc_path TEXT NOT NULL,
+            target_doc_path TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            label TEXT NOT NULL
+        );
+
+        CREATE TABLE files (
+            path TEXT PRIMARY KEY,
+            file_exists INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            size INTEGER NOT NULL
+        );
+
+        CREATE TABLE unresolved_refs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            source_doc_path TEXT NOT NULL,
+            target TEXT NOT NULL,
+            target_doc_path TEXT NOT NULL,
+            target_plan_id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            provenance TEXT NOT NULL
+        );
+
+        CREATE TABLE external_refs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            source_doc_path TEXT NOT NULL,
+            target TEXT NOT NULL,
+            target_path TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            label TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            provenance TEXT NOT NULL,
+            file_exists INTEGER NOT NULL,
+            trusted INTEGER NOT NULL,
+            trusted_root TEXT NOT NULL,
+            external_worktree TEXT NOT NULL
+        );
+
+        CREATE VIRTUAL TABLE node_fts USING fts5(
+            plan_id UNINDEXED,
+            title,
+            doc_path,
+            body,
+            notes
+        );
+
+        CREATE TABLE semantic_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            provenance TEXT NOT NULL,
+            relation_scope TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            source_doc_path TEXT NOT NULL,
+            target_doc_path TEXT NOT NULL,
+            shared_terms TEXT NOT NULL
+        );
+        '''
+    )
+
+
+def rebuild_sqlite_index(repo_root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    rows = load_registry_rows_for_update(repo_root, cfg)
+    if rows is None:
+        return {'error': 'registry missing', 'query': 'index'}
+    graph = PlanGraph(rows, cfg, repo_root=repo_root)
+    body_links_result = graph.body_links()
+    if 'error' in body_links_result:
+        return {'error': body_links_result['error'], 'query': 'index'}
+
+    db_path = index_db_path(repo_root, cfg)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        ensure_index_schema(conn)
+        conn.executemany(
+            '''
+            INSERT INTO metadata (key, value)
+            VALUES (?, ?)
+            ''',
+            [
+                ('schema_version', str(INDEX_SCHEMA_VERSION)),
+                ('schema_note', INDEX_SCHEMA_NOTE),
+                ('indexed_at', date.today().isoformat()),
+                ('repo_root', str(repo_root)),
+                ('registry_path', cfg.get('registry_path', 'docs/plan_registry.md')),
+            ],
+        )
+        conn.executemany(
+            '''
+            INSERT INTO nodes (
+                plan_id, title, doc_path, doc_role, workstream, lifecycle_status,
+                execution_status, authoritative, classification_source, confidence,
+                parent_plan, supersedes, superseded_by, created_at, last_reviewed_at, notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            [
+                (
+                    row.get('plan_id', ''),
+                    row.get('title', ''),
+                    row.get('doc_path', ''),
+                    row.get('doc_role', ''),
+                    row.get('workstream', ''),
+                    row.get('lifecycle_status', ''),
+                    row.get('execution_status', ''),
+                    row.get('authoritative', ''),
+                    row.get('classification_source', ''),
+                    row.get('confidence', ''),
+                    row.get('parent_plan', ''),
+                    row.get('supersedes', ''),
+                    row.get('superseded_by', ''),
+                    row.get('created_at', ''),
+                    row.get('last_reviewed_at', ''),
+                    row.get('notes', ''),
+                )
+                for row in rows
+            ],
+        )
+        all_edges = registry_edges(rows) + [
+            {
+                'source': item.get('source', ''),
+                'target': item.get('target', ''),
+                'kind': item.get('kind', 'links_to'),
+                'provenance': item.get('provenance', 'body-link'),
+                'source_doc_path': item.get('source_doc_path', ''),
+                'target_doc_path': item.get('target_doc_path', ''),
+                'line': int(item.get('line', 0) or 0),
+                'label': item.get('label', ''),
+            }
+            for item in body_links_result.get('edges', [])
+        ]
+        conn.executemany(
+            '''
+            INSERT INTO edges (source, target, kind, provenance, source_doc_path, target_doc_path, line, label)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            [
+                (
+                    item.get('source', ''),
+                    item.get('target', ''),
+                    item.get('kind', ''),
+                    item.get('provenance', ''),
+                    item.get('source_doc_path', ''),
+                    item.get('target_doc_path', ''),
+                    int(item.get('line', 0) or 0),
+                    item.get('label', ''),
+                )
+                for item in all_edges
+            ],
+        )
+        conn.executemany(
+            '''
+            INSERT INTO files (path, file_exists, sha256, mtime_ns, size)
+            VALUES (?, ?, ?, ?, ?)
+            ''',
+            [
+                (
+                    item['path'],
+                    int(item['exists']),
+                    item['sha256'],
+                    int(item['mtime_ns']),
+                    int(item['size']),
+                )
+                for item in current_index_fingerprints(repo_root, cfg, rows).values()
+            ],
+        )
+        conn.executemany(
+            '''
+            INSERT INTO unresolved_refs (
+                source, source_doc_path, target, target_doc_path, target_plan_id,
+                label, line, reason, provenance
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            [
+                (
+                    item.get('source', ''),
+                    item.get('source_doc_path', ''),
+                    item.get('target', ''),
+                    item.get('target_doc_path', ''),
+                    item.get('target_plan_id', ''),
+                    item.get('label', ''),
+                    int(item.get('line', 0) or 0),
+                    item.get('reason', ''),
+                    item.get('provenance', ''),
+                )
+                for item in body_links_result.get('unresolved', [])
+            ],
+        )
+        conn.executemany(
+            '''
+            INSERT INTO external_refs (
+                source, source_doc_path, target, target_path, kind, label, line,
+                provenance, file_exists, trusted, trusted_root, external_worktree
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            [
+                (
+                    item.get('source', ''),
+                    item.get('source_doc_path', ''),
+                    item.get('target', ''),
+                    item.get('target_path', ''),
+                    item.get('kind', 'external_reference'),
+                    item.get('label', ''),
+                    int(item.get('line', 0) or 0),
+                    item.get('provenance', ''),
+                    int(bool(item.get('exists'))),
+                    int(bool(item.get('trusted'))),
+                    item.get('trusted_root', ''),
+                    item.get('external_worktree', ''),
+                )
+                for item in body_links_result.get('external_references', [])
+            ],
+        )
+        conn.executemany(
+            '''
+            INSERT INTO node_fts (plan_id, title, doc_path, body, notes)
+            VALUES (?, ?, ?, ?, ?)
+            ''',
+            [
+                (
+                    row.get('plan_id', ''),
+                    row.get('title', ''),
+                    row.get('doc_path', ''),
+                    doc_body((repo_root / row.get('doc_path', '')).read_text(encoding='utf-8', errors='ignore'))
+                    if (repo_root / row.get('doc_path', '')).is_file()
+                    else '',
+                    row.get('notes', ''),
+                )
+                for row in rows
+            ],
+        )
+        if semantic_enabled(cfg):
+            conn.executemany(
+                '''
+                INSERT INTO semantic_edges (
+                    source, target, kind, provenance, relation_scope, confidence,
+                    source_doc_path, target_doc_path, shared_terms
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                [
+                    (
+                        item.get('source', ''),
+                        item.get('target', ''),
+                        item.get('kind', 'semantic_overlap'),
+                        item.get('provenance', 'semantic-inferred'),
+                        item.get('relation_scope', 'registry-zero-relation'),
+                        float(item.get('confidence', 0.0)),
+                        item.get('source_doc_path', ''),
+                        item.get('target_doc_path', ''),
+                        item.get('shared_terms', ''),
+                    )
+                    for item in semantic_edges_for_rows(repo_root, cfg, rows)
+                ],
+            )
+
+    return sqlite_status(repo_root, cfg, rows=rows)
+
+
+def sqlite_table_count(conn: sqlite3.Connection, table: str) -> int:
+    return int(conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0])
+
+
+def load_index_metadata(conn: sqlite3.Connection) -> dict[str, str]:
+    return {
+        str(row[0]): str(row[1])
+        for row in conn.execute('SELECT key, value FROM metadata')
+    }
+
+
+def index_staleness(
+    conn: sqlite3.Connection,
+    repo_root: Path,
+    cfg: dict[str, Any],
+    rows: list[dict[str, str]],
+) -> tuple[bool, list[dict[str, str]]]:
+    stored = {
+        str(row[0]): {
+            'path': str(row[0]),
+            'exists': int(row[1]),
+            'sha256': str(row[2]),
+            'mtime_ns': int(row[3]),
+            'size': int(row[4]),
+        }
+        for row in conn.execute('SELECT path, file_exists, sha256, mtime_ns, size FROM files')
+    }
+    current = current_index_fingerprints(repo_root, cfg, rows)
+    stale_files: list[dict[str, str]] = []
+    for path, item in current.items():
+        stored_item = stored.get(path)
+        if stored_item is None:
+            stale_files.append({'path': path, 'reason': 'not-indexed'})
+            continue
+        for field_name in ['exists', 'sha256', 'mtime_ns', 'size']:
+            if stored_item[field_name] != item[field_name]:
+                stale_files.append({'path': path, 'reason': f'{field_name}-changed'})
+                break
+    for path in sorted(set(stored) - set(current)):
+        stale_files.append({'path': path, 'reason': 'no-longer-tracked'})
+    return bool(stale_files), stale_files
+
+
+def sqlite_status(repo_root: Path, cfg: dict[str, Any], rows: list[dict[str, str]] | None = None) -> dict[str, Any]:
+    db_path = index_db_path(repo_root, cfg)
+    registry_path = repo_root / cfg.get('registry_path', 'docs/plan_registry.md')
+    registry_rows = rows
+    errors: list[str] = []
+    if registry_rows is None:
+        if registry_path.exists():
+            registry_rows = parse_registry_rows(registry_path.read_text(encoding='utf-8'))
+        else:
+            registry_rows = []
+            errors.append('registry missing')
+
+    result: dict[str, Any] = {
+        'query': 'status',
+        'db_path': str(db_path),
+        'exists': db_path.exists(),
+        'stale': True,
+        'schema_version': '',
+        'schema_note': '',
+        'indexed_at': '',
+        'node_count': 0,
+        'edge_count': 0,
+        'file_count': 0,
+        'unresolved_count': 0,
+        'external_reference_count': 0,
+        'semantic_edge_count': 0,
+        'registry_row_count': len(registry_rows),
+        'stale_files': [],
+        'errors': errors,
+    }
+    if not db_path.exists():
+        return result
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            metadata = load_index_metadata(conn)
+            schema_version = metadata.get('schema_version', '')
+            result['schema_version'] = schema_version
+            result['schema_note'] = metadata.get('schema_note', '')
+            result['indexed_at'] = metadata.get('indexed_at', '')
+            result['node_count'] = sqlite_table_count(conn, 'nodes')
+            result['edge_count'] = sqlite_table_count(conn, 'edges')
+            result['file_count'] = sqlite_table_count(conn, 'files')
+            result['unresolved_count'] = sqlite_table_count(conn, 'unresolved_refs')
+            result['external_reference_count'] = sqlite_table_count(conn, 'external_refs')
+            try:
+                result['semantic_edge_count'] = sqlite_table_count(conn, 'semantic_edges')
+            except sqlite3.DatabaseError:
+                result['semantic_edge_count'] = 0
+            stale, stale_files = index_staleness(conn, repo_root, cfg, registry_rows)
+            result['stale'] = stale or schema_version != str(INDEX_SCHEMA_VERSION) or bool(errors)
+            result['stale_files'] = stale_files
+            if schema_version != str(INDEX_SCHEMA_VERSION):
+                result['errors'].append(f'schema version mismatch: {schema_version}')
+    except sqlite3.DatabaseError as exc:
+        result['errors'].append(f'index database error: {exc}')
+        result['stale'] = True
+    return result
+
+
+def run_index(repo_root: Path, cfg: dict[str, Any]) -> int:
+    result = rebuild_sqlite_index(repo_root, cfg)
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 1 if 'error' in result else 0
+
+
+def run_status(repo_root: Path, cfg: dict[str, Any]) -> int:
+    result = sqlite_status(repo_root, cfg)
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def sqlite_query(repo_root: Path, cfg: dict[str, Any], text: str) -> dict[str, Any]:
+    status = sqlite_status(repo_root, cfg)
+    if not status['exists']:
+        return {
+            'query': 'query',
+            'text': text,
+            'stale': True,
+            'error': 'index missing',
+            'suggestion': 'run `plangraph index` first',
+            'results': [],
+            'count': 0,
+        }
+    if status['stale']:
+        return {
+            'query': 'query',
+            'text': text,
+            'stale': True,
+            'error': 'index stale',
+            'suggestion': 'run `plangraph sync` before querying',
+            'results': [],
+            'count': 0,
+        }
+
+    db_path = index_db_path(repo_root, cfg)
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    match_source = 'fts'
+    try:
+        with sqlite3.connect(db_path) as conn:
+            try:
+                rows = conn.execute(
+                    '''
+                    SELECT plan_id, title, doc_path, body, notes
+                    FROM node_fts
+                    WHERE node_fts MATCH ?
+                    ORDER BY bm25(node_fts)
+                    LIMIT 20
+                    ''',
+                    (text,),
+                ).fetchall()
+            except sqlite3.DatabaseError:
+                rows = []
+            if not rows:
+                rows = conn.execute(
+                    '''
+                    SELECT plan_id, title, doc_path, body, notes
+                    FROM node_fts
+                    WHERE title LIKE ? OR doc_path LIKE ? OR body LIKE ? OR notes LIKE ?
+                    LIMIT 20
+                    ''',
+                    tuple(f'%{text}%' for _ in range(4)),
+                ).fetchall()
+                match_source = 'like'
+
+            for row in rows:
+                plan_id = str(row[0])
+                if plan_id in seen:
+                    continue
+                seen.add(plan_id)
+                results.append({
+                    'plan_id': plan_id,
+                    'title': str(row[1]),
+                    'doc_path': str(row[2]),
+                    'match_source': match_source,
+                })
+    except sqlite3.DatabaseError as exc:
+        return {
+            'query': 'query',
+            'text': text,
+            'stale': True,
+            'error': f'index unreadable: {exc}',
+            'suggestion': 'run `plangraph sync` before querying',
+            'results': [],
+            'count': 0,
+        }
+
+    return {
+        'query': 'query',
+        'text': text,
+        'stale': False,
+        'match_strategy': match_source,
+        'count': len(results),
+        'results': results,
+        'status': status,
+    }
+
+
+def run_query(repo_root: Path, cfg: dict[str, Any], text: str) -> int:
+    result = sqlite_query(repo_root, cfg, text)
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 1 if result.get('error') else 0
+
+
+def run_sync(repo_root: Path, cfg: dict[str, Any]) -> int:
+    status = sqlite_status(repo_root, cfg)
+    if not status['exists'] or status['stale']:
+        rebuilt = rebuild_sqlite_index(repo_root, cfg)
+        if 'error' in rebuilt:
+            print(json.dumps({'query': 'sync', 'action': 'failed', 'status': rebuilt}, ensure_ascii=False, indent=2, sort_keys=True))
+            return 1
+        print(json.dumps({'query': 'sync', 'action': 'rebuilt', 'status': rebuilt}, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print(json.dumps({'query': 'sync', 'action': 'noop', 'status': status}, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def run_semantic(repo_root: Path, cfg: dict[str, Any]) -> int:
+    semantic_cfg = deep_merge(cfg, {'semantic': {'enabled': True}})
+    status = rebuild_sqlite_index(repo_root, semantic_cfg)
+    if 'error' in status:
+        result = {'query': 'semantic', 'error': status['error'], 'status': status}
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 1
+    semantic_results: list[dict[str, Any]] = []
+    db_path = index_db_path(repo_root, semantic_cfg)
+    try:
+        with sqlite3.connect(db_path) as conn:
+            semantic_rows = conn.execute(
+                '''
+                SELECT source, target, kind, provenance, relation_scope, confidence,
+                    source_doc_path, target_doc_path, shared_terms
+                FROM semantic_edges
+                ORDER BY confidence DESC, id ASC
+                LIMIT 20
+                '''
+            ).fetchall()
+    except sqlite3.DatabaseError:
+        semantic_rows = []
+    for row in semantic_rows:
+        semantic_results.append({
+            'source': str(row[0]),
+            'target': str(row[1]),
+            'kind': str(row[2]),
+            'provenance': str(row[3]),
+            'relation_scope': str(row[4]),
+            'confidence': float(row[5]),
+            'source_doc_path': str(row[6]),
+            'target_doc_path': str(row[7]),
+            'shared_terms': str(row[8]),
+        })
+    result = {
+        'query': 'semantic',
+        'enabled': True,
+        'provenance': 'semantic-inferred',
+        'semantic_edge_count': status.get('semantic_edge_count', 0),
+        'semantic_results': semantic_results,
+        'status': status,
+        'notes': [
+            'Semantic edges are soft hints only.',
+            'They prioritize high-confidence pairs without direct registry relations and outside the same workstream.',
+            'They do not update the registry and do not participate in fatal lint.',
+        ],
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def mcp_tools() -> list[dict[str, Any]]:
+    mode_schema = {
+        'type': 'string',
+        'enum': ['compact', 'expanded'],
+        'description': 'compact returns a ranked short result by default; expanded returns the full related set.',
+    }
+    repo_arg_schema = {
+        'type': 'string',
+        'description': 'Optional path to a governed PlanGraph project. Use this when the MCP workspace root is a parent folder.',
+    }
+    repo_args = {
+        'projectPath': repo_arg_schema,
+        'repo_root': repo_arg_schema,
+    }
+    return [
+        {
+            'name': 'plangraph_status',
+            'description': 'Return SQLite cache status, freshness, and counts for the current repo.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    **repo_args,
+                },
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'plangraph_mainline',
+            'description': 'Return the current mainline heads from the registry-backed graph.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    **repo_args,
+                    'workstream': {'type': 'string'},
+                },
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'plangraph_query',
+            'description': 'Search indexed plan titles, paths, bodies, and notes in the local SQLite cache.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    **repo_args,
+                    'text': {'type': 'string'},
+                },
+                'required': ['text'],
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'plangraph_lineage',
+            'description': 'Return registry-backed supersession lineage for one plan.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    **repo_args,
+                    'plan_id': {'type': 'string'},
+                },
+                'required': ['plan_id'],
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'plangraph_impact',
+            'description': 'Return registry-backed plans that may be affected by changing one plan.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    **repo_args,
+                    'plan_id': {'type': 'string'},
+                    'mode': mode_schema,
+                },
+                'required': ['plan_id'],
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'plangraph_context',
+            'description': 'Return deterministic related context for one plan by aggregating mainline, lineage, impact, conflicts, and body links.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    **repo_args,
+                    'plan_id': {'type': 'string'},
+                    'mode': mode_schema,
+                },
+                'required': ['plan_id'],
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'plangraph_conflicts',
+            'description': 'Return deterministic registry-derived planning conflicts.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    **repo_args,
+                },
+                'additionalProperties': False,
+            },
+        },
+        {
+            'name': 'plangraph_body_links',
+            'description': 'Return explicit Markdown body-link edges, unresolved refs, and external references.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    **repo_args,
+                    'plan_id': {'type': 'string'},
+                },
+                'additionalProperties': False,
+            },
+        },
+    ]
+
+
+def mcp_result(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'content': [
+            {
+                'type': 'text',
+                'text': json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            }
+        ],
+        'isError': bool(payload.get('error')),
+    }
+
+
+def mcp_call_tool(repo_root: Path, cfg: dict[str, Any], name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    arguments = arguments or {}
+    tool_repo_root, tool_cfg, _, _ = resolve_mcp_tool_repo_root(arguments, repo_root, cfg)
+    if name == 'plangraph_status':
+        return mcp_result(sqlite_status(tool_repo_root, tool_cfg))
+    if name == 'plangraph_mainline':
+        graph = load_graph(tool_repo_root, tool_cfg)
+        if graph is None:
+            return mcp_result({'error': 'registry missing', 'query': 'mainline'})
+        return mcp_result(graph.mainline(arguments.get('workstream') or None))
+    if name == 'plangraph_query':
+        text = str(arguments.get('text', '')).strip()
+        if not text:
+            return mcp_result({'error': 'text is required', 'query': 'query'})
+        return mcp_result(sqlite_query(tool_repo_root, tool_cfg, text))
+    if name in {'plangraph_lineage', 'plangraph_impact', 'plangraph_context', 'plangraph_conflicts', 'plangraph_body_links'}:
+        graph = load_graph(tool_repo_root, tool_cfg)
+        if graph is None:
+            return mcp_result({'error': 'registry missing', 'query': name.removeprefix('plangraph_').replace('_', '-')})
+        if name == 'plangraph_conflicts':
+            return mcp_result(graph.conflicts())
+        if name == 'plangraph_body_links':
+            plan_id = str(arguments.get('plan_id', '')).strip() or None
+            return mcp_result(graph.body_links(plan_id))
+        plan_id = str(arguments.get('plan_id', '')).strip()
+        if not plan_id:
+            return mcp_result({'error': 'plan_id is required', 'query': name.removeprefix('plangraph_')})
+        if name == 'plangraph_lineage':
+            return mcp_result(graph.lineage(plan_id))
+        if name == 'plangraph_context':
+            return mcp_result(graph.context(plan_id, mode=str(arguments.get('mode', 'compact'))))
+        return mcp_result(graph.impact(plan_id, mode=str(arguments.get('mode', 'compact'))))
+    return mcp_result({'error': f'unknown tool: {name}'})
+
+
+def mcp_initialize_result(repo_root: Path, cfg: dict[str, Any], params: dict[str, Any] | None) -> dict[str, Any]:
+    active_repo_root, discovery_source, discovery_marker = resolve_mcp_repo_root(params, repo_root)
+    active_cfg = load_effective_config(active_repo_root)
+    status = sqlite_status(active_repo_root, active_cfg)
+    return {
+        'protocolVersion': MCP_PROTOCOL_VERSION,
+        'serverInfo': {'name': 'plangraph', 'version': str(cfg.get('version', '1'))},
+        'capabilities': {
+            'tools': {'listChanged': False},
+        },
+        'instructions': (
+            'PlanGraph auto-discovered the workspace root. '
+            'Pass rootUri/workspaceFolders during initialize or set PLANGRAPH_REPO_ROOT to override it.'
+        ),
+        'meta': {
+            'workspace_root': str(active_repo_root),
+            'discovery_source': discovery_source,
+            'discovery_marker': discovery_marker,
+            'registry_present': status['registry_row_count'] > 0 or 'registry missing' not in status.get('errors', []),
+            'index_exists': bool(status.get('exists')),
+            'index_stale': bool(status.get('stale')),
+        },
+    }
+
+
+def mcp_handle_request(repo_root: Path, cfg: dict[str, Any], request: dict[str, Any]) -> dict[str, Any] | None:
+    if request.get('jsonrpc') != '2.0':
+        return {'jsonrpc': '2.0', 'id': request.get('id'), 'error': {'code': -32600, 'message': 'Invalid Request'}}
+    method = request.get('method')
+    request_id = request.get('id')
+    params = request.get('params') or {}
+    if method == 'initialize':
+        return {'jsonrpc': '2.0', 'id': request_id, 'result': mcp_initialize_result(repo_root, cfg, params)}
+    if method == 'tools/list':
+        return {'jsonrpc': '2.0', 'id': request_id, 'result': {'tools': mcp_tools()}}
+    if method == 'tools/call':
+        tool_name = params.get('name', '')
+        return {'jsonrpc': '2.0', 'id': request_id, 'result': mcp_call_tool(repo_root, cfg, tool_name, params.get('arguments'))}
+    if method in {'initialized', 'notifications/initialized'}:
+        return None
+    return {'jsonrpc': '2.0', 'id': request_id, 'error': {'code': -32601, 'message': f'Method not found: {method}'}}
+
+
+def run_mcp(repo_root: Path, cfg: dict[str, Any]) -> int:
+    active_repo_root = repo_root
+    active_cfg = cfg
+    for line in sys.stdin:
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            request = json.loads(raw)
+        except json.JSONDecodeError:
+            response = {'jsonrpc': '2.0', 'id': None, 'error': {'code': -32700, 'message': 'Parse error'}}
+        else:
+            if request.get('jsonrpc') == '2.0' and request.get('method') == 'initialize':
+                active_repo_root, _, _ = resolve_mcp_repo_root(request.get('params') or {}, repo_root)
+                active_cfg = load_effective_config(active_repo_root)
+            response = mcp_handle_request(active_repo_root, active_cfg, request)
+        if response is None:
+            continue
+        sys.stdout.write(json.dumps(response, ensure_ascii=False) + '\n')
+        sys.stdout.flush()
+    return 0
+
+
+def run_graph(repo_root: Path, cfg: dict[str, Any], ids: list[str], workstream: str | None = None, mode: str = 'compact') -> int:
     if not ids:
-        print('ERROR: graph requires a query: mainline, lineage, impact, conflicts, or body-links')
+        print('ERROR: graph requires a query: mainline, lineage, impact, context, conflicts, or body-links')
         return 2
     query = ids[0]
     graph = load_graph(repo_root, cfg)
@@ -1659,7 +3024,12 @@ def run_graph(repo_root: Path, cfg: dict[str, Any], ids: list[str], workstream: 
         if len(ids) != 2:
             print('ERROR: graph impact requires exactly one plan_id')
             return 2
-        result = graph.impact(ids[1])
+        result = graph.impact(ids[1], mode=mode)
+    elif query == 'context':
+        if len(ids) != 2:
+            print('ERROR: graph context requires exactly one plan_id')
+            return 2
+        result = graph.context(ids[1], mode=mode)
     elif query == 'conflicts':
         result = graph.conflicts()
     elif query == 'body-links':
@@ -2432,14 +3802,216 @@ def run_refresh(repo_root: Path) -> None:
     print(f'refresh complete: mode={update_mode} auto_candidates={len(auto_entries)} quarantined={len(quarantined)}')
 
 
+def codex_mcp_get(name: str) -> dict[str, Any] | None:
+    result = subprocess.run(
+        ['codex', 'mcp', 'get', name, '--json'],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def plangraph_mcp_command(script_path: Path) -> list[str]:
+    return [str(script_path), 'mcp']
+
+
+def expected_plangraph_mcp_transport(script_path: Path) -> dict[str, Any]:
+    return {
+        'type': 'stdio',
+        'command': str(script_path),
+        'args': ['mcp'],
+        'env': {},
+    }
+
+
+def normalize_transport(transport: dict[str, Any] | None) -> dict[str, Any]:
+    transport = transport or {}
+    return {
+        'type': transport.get('type'),
+        'command': transport.get('command'),
+        'args': list(transport.get('args') or []),
+        'env': dict(transport.get('env') or {}),
+    }
+
+
+def install_mcp_server(repo_root: Path, script_path: Path, name: str = DEFAULT_MCP_SERVER_NAME) -> int:
+    expected = expected_plangraph_mcp_transport(script_path)
+    existing = codex_mcp_get(name)
+    if existing is not None and normalize_transport(existing.get('transport')) == expected:
+        result = {
+            'query': 'install',
+            'host': 'codex',
+            'server_name': name,
+            'changed': False,
+            'status': 'already-configured',
+            'transport': expected,
+            'workspace_root': str(repo_root),
+            'discovery': {
+                'mode': MCP_DISCOVERY_MODE,
+                'override_env_vars': MCP_DISCOVERY_OVERRIDE_ENV_VARS,
+                'tool_arguments': ['projectPath', 'repo_root'],
+            },
+            'restart_required': True,
+            'notes': [
+                'Codex MCP server already matches the expected PlanGraph stdio configuration.',
+                'Repo discovery comes from initialize rootUri/workspaceFolders when the host provides them, including one unique governed child repo under a parent workspace.',
+                'Agents may pass projectPath or repo_root per tool call to target a specific governed repo.',
+                'Restart Codex if the MCP tool list does not refresh automatically.',
+            ],
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    if existing is not None:
+        remove = subprocess.run(
+            ['codex', 'mcp', 'remove', name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if remove.returncode != 0:
+            result = {
+                'query': 'install',
+                'host': 'codex',
+                'server_name': name,
+                'changed': False,
+                'status': 'remove-failed',
+                'error': remove.stderr.strip() or remove.stdout.strip() or f'failed to remove existing MCP server: {name}',
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+            return 1
+
+    add_cmd = ['codex', 'mcp', 'add', name, '--', *plangraph_mcp_command(script_path)]
+    added = subprocess.run(
+        add_cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if added.returncode != 0:
+        result = {
+            'query': 'install',
+            'host': 'codex',
+            'server_name': name,
+            'changed': False,
+            'status': 'add-failed',
+            'error': added.stderr.strip() or added.stdout.strip() or 'failed to add Codex MCP server',
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 1
+
+    result = {
+        'query': 'install',
+        'host': 'codex',
+        'server_name': name,
+        'changed': True,
+        'status': 'installed',
+        'transport': expected,
+        'workspace_root': str(repo_root),
+        'discovery': {
+            'mode': MCP_DISCOVERY_MODE,
+            'override_env_vars': MCP_DISCOVERY_OVERRIDE_ENV_VARS,
+            'tool_arguments': ['projectPath', 'repo_root'],
+        },
+        'restart_required': True,
+        'notes': [
+            'Codex MCP entry now launches the local PlanGraph stdio server.',
+            'The server discovers the active repo from initialize rootUri/workspaceFolders, including one unique governed child repo under a parent workspace.',
+            'Agents may pass projectPath or repo_root per tool call to target a specific governed repo.',
+            'Restart Codex so the new MCP tools become available in interactive sessions.',
+        ],
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def uninstall_mcp_server(name: str = DEFAULT_MCP_SERVER_NAME) -> int:
+    existing = codex_mcp_get(name)
+    if existing is None:
+        result = {
+            'query': 'uninstall',
+            'host': 'codex',
+            'server_name': name,
+            'changed': False,
+            'status': 'not-installed',
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    removed = subprocess.run(
+        ['codex', 'mcp', 'remove', name],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if removed.returncode != 0:
+        result = {
+            'query': 'uninstall',
+            'host': 'codex',
+            'server_name': name,
+            'changed': False,
+            'status': 'remove-failed',
+            'error': removed.stderr.strip() or removed.stdout.strip() or 'failed to remove Codex MCP server',
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 1
+    result = {
+        'query': 'uninstall',
+        'host': 'codex',
+        'server_name': name,
+        'changed': True,
+        'status': 'removed',
+        'restart_required': True,
+        'notes': [
+            'Removed the Codex MCP entry for PlanGraph.',
+            'Restart Codex if the old MCP tools still appear in the current session.',
+        ],
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def describe_mcp_installation(repo_root: Path, script_path: Path, name: str = DEFAULT_MCP_SERVER_NAME) -> int:
+    expected = expected_plangraph_mcp_transport(script_path)
+    existing = codex_mcp_get(name)
+    result = {
+        'query': 'mcp-discover',
+        'host': 'codex',
+        'server_name': name,
+        'workspace_root': str(repo_root),
+        'expected_transport': expected,
+        'configured': existing is not None,
+        'matches_expected': False,
+        'configured_transport': None,
+        'discovery': {
+            'mode': MCP_DISCOVERY_MODE,
+            'override_env_vars': MCP_DISCOVERY_OVERRIDE_ENV_VARS,
+            'tool_arguments': ['projectPath', 'repo_root'],
+        },
+    }
+    if existing is not None:
+        configured_transport = normalize_transport(existing.get('transport'))
+        result['configured_transport'] = configured_transport
+        result['matches_expected'] = configured_transport == expected
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['init', 'bootstrap', 'refresh', 'register', 'graph', 'lint', 'report', 'adopt-external-references', 'install-agents-block', 'remove-agents-block', 'close', 'supersede'])
+    parser.add_argument('command', choices=['init', 'bootstrap', 'refresh', 'register', 'graph', 'index', 'status', 'sync', 'query', 'semantic', 'mcp', 'install', 'uninstall', 'discover-mcp', 'lint', 'report', 'adopt-external-references', 'install-agents-block', 'remove-agents-block', 'close', 'supersede'])
     parser.add_argument('ids', nargs='*')
     parser.add_argument('--repo-root', default=os.getcwd())
     parser.add_argument('--lifecycle-status', default='closed')
     parser.add_argument('--execution-status')
     parser.add_argument('--workstream')
+    parser.add_argument('--mode', choices=['compact', 'expanded'], default='compact')
     parser.add_argument('--skip-install-agents-block', action='store_true')
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
@@ -2458,7 +4030,40 @@ def main() -> int:
 
     if args.command == 'graph':
         cfg = load_effective_config(repo_root)
-        return run_graph(repo_root, cfg, args.ids, workstream=args.workstream)
+        return run_graph(repo_root, cfg, args.ids, workstream=args.workstream, mode=args.mode)
+
+    if args.command == 'index':
+        cfg = load_effective_config(repo_root)
+        return run_index(repo_root, cfg)
+
+    if args.command == 'status':
+        cfg = load_effective_config(repo_root)
+        return run_status(repo_root, cfg)
+
+    if args.command == 'sync':
+        cfg = load_effective_config(repo_root)
+        return run_sync(repo_root, cfg)
+
+    if args.command == 'query':
+        if not args.ids:
+            print('ERROR: query requires text')
+            return 2
+        cfg = load_effective_config(repo_root)
+        return run_query(repo_root, cfg, ' '.join(args.ids))
+
+    if args.command == 'semantic':
+        cfg = load_effective_config(repo_root)
+        return run_semantic(repo_root, cfg)
+
+    if args.command == 'mcp':
+        cfg = load_effective_config(repo_root)
+        return run_mcp(repo_root, cfg)
+    if args.command == 'install':
+        return install_mcp_server(repo_root, Path(__file__).resolve())
+    if args.command == 'uninstall':
+        return uninstall_mcp_server()
+    if args.command == 'discover-mcp':
+        return describe_mcp_installation(repo_root, Path(__file__).resolve())
 
     cfg = ensure_repo_files(repo_root)
 

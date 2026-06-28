@@ -120,6 +120,92 @@ class PlanGraphTests(unittest.TestCase):
         result = graph.impact('week1')
         impacted_ids = {item['plan']['plan_id'] for item in result['impacted']}
         self.assertIn('roadmap-v2', impacted_ids)
+        self.assertEqual(result['mode'], 'compact')
+
+    def test_impact_defaults_to_compact_and_expanded_returns_all(self):
+        rows = [
+            ['target', 'Target', 'docs/target.md', 'execution_plan', 'core', 'active', 'in_progress', 'true', 'manual', '1.00', '', '', '', '', '', ''],
+        ]
+        rows.extend([
+            [f'peer-{index}', f'Peer {index}', f'docs/peer_{index}.md', 'execution_plan', 'core', 'active', 'not_started', 'false', 'manual', '1.00', '', '', '', '', '', '']
+            for index in range(12)
+        ])
+        graph = plan_governance.PlanGraph(plan_governance.parse_registry_rows(registry_text(rows)), {})
+
+        compact = graph.impact('target')
+        expanded = graph.impact('target', mode='expanded')
+
+        self.assertEqual(compact['mode'], 'compact')
+        self.assertEqual(compact['impact_count'], 8)
+        self.assertEqual(compact['total_impact_count'], 12)
+        self.assertEqual(compact['omitted_impact_count'], 4)
+        self.assertEqual(len(compact['impacted']), 8)
+        self.assertEqual(expanded['mode'], 'expanded')
+        self.assertEqual(expanded['impact_count'], 12)
+        self.assertEqual(expanded['total_impact_count'], 12)
+        self.assertEqual(expanded['omitted_impact_count'], 0)
+        self.assertEqual(len(expanded['impacted']), 12)
+
+    def test_context_aggregates_must_read_and_related_queries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            rows = [
+                ['roadmap-v1', 'Roadmap v1', 'docs/roadmap_v1.md', 'master_plan', 'core', 'superseded', 'cancelled', 'false', 'manual', '1.00', '', '', 'roadmap-v2', '2026-01-01', '2026-01-02', ''],
+                ['roadmap-v2', 'Roadmap v2', 'docs/roadmap_v2.md', 'master_plan', 'core', 'active', 'in_progress', 'true', 'manual', '1.00', '', 'roadmap-v1', '', '2026-01-02', '2026-01-03', 'part of current mainline'],
+                ['week1', 'Week 1', 'docs/week1.md', 'execution_plan', 'core', 'active', 'not_started', 'true', 'manual', '1.00', 'roadmap-v2', '', '', '2026-01-03', '2026-01-03', ''],
+                ['decision', 'Decision', 'docs/decision.md', 'decision_doc', 'core', 'active', 'n_a', 'false', 'manual', '1.00', '', '', '', '2026-01-04', '2026-01-04', ''],
+            ]
+            (docs / 'roadmap_v1.md').write_text('# Roadmap v1\n', encoding='utf-8')
+            (docs / 'roadmap_v2.md').write_text('# Roadmap v2\n', encoding='utf-8')
+            (docs / 'week1.md').write_text('# Week 1\n\nSee [decision](decision.md).\n', encoding='utf-8')
+            (docs / 'decision.md').write_text('# Decision\n', encoding='utf-8')
+
+            result = plan_governance.PlanGraph(
+                plan_governance.parse_registry_rows(registry_text(rows)),
+                {},
+                repo_root=root,
+            ).context('week1')
+
+            self.assertEqual(result['query'], 'context')
+            self.assertEqual(result['plan']['plan_id'], 'week1')
+            self.assertEqual(result['lineage']['query'], 'lineage')
+            self.assertEqual(result['impact']['query'], 'impact')
+            self.assertEqual(result['body_links']['query'], 'body-links')
+            self.assertEqual(result['body_links']['edge_count'], 1)
+
+            must_read = {item['doc_path']: set(item['reasons']) for item in result['must_read']}
+            self.assertIn('docs/week1.md', must_read)
+            self.assertIn('selected-plan', must_read['docs/week1.md'])
+            self.assertIn('docs/roadmap_v2.md', must_read)
+            self.assertIn('parent-plan', must_read['docs/roadmap_v2.md'])
+            self.assertIn('docs/decision.md', must_read)
+            self.assertIn('body-linked-doc', must_read['docs/decision.md'])
+
+    def test_context_defaults_to_compact_and_expanded_returns_full_must_read(self):
+        rows = [
+            ['target', 'Target', 'docs/target.md', 'execution_plan', 'core', 'active', 'in_progress', 'true', 'manual', '1.00', '', '', '', '', '', ''],
+        ]
+        rows.extend([
+            [f'peer-{index}', f'Peer {index}', f'docs/peer_{index}.md', 'execution_plan', 'core', 'active', 'not_started', 'false', 'manual', '1.00', '', '', '', '', '', '']
+            for index in range(12)
+        ])
+        graph = plan_governance.PlanGraph(plan_governance.parse_registry_rows(registry_text(rows)), {})
+
+        compact = graph.context('target')
+        expanded = graph.context('target', mode='expanded')
+
+        self.assertEqual(compact['mode'], 'compact')
+        self.assertLessEqual(compact['must_read_count'], 8)
+        self.assertEqual(compact['must_read_count'], len(compact['must_read']))
+        self.assertGreater(compact['total_must_read_count'], compact['must_read_count'])
+        self.assertGreater(compact['omitted_must_read_count'], 0)
+        self.assertEqual(compact['must_read'][0]['doc_path'], 'docs/target.md')
+        self.assertEqual(expanded['mode'], 'expanded')
+        self.assertEqual(expanded['must_read_count'], expanded['total_must_read_count'])
+        self.assertEqual(expanded['omitted_must_read_count'], 0)
+        self.assertGreater(expanded['must_read_count'], compact['must_read_count'])
 
     def test_conflicts_reports_deterministic_hard_conflicts(self):
         rows = plan_governance.parse_registry_rows(registry_text([
@@ -134,6 +220,17 @@ class PlanGraphTests(unittest.TestCase):
         self.assertIn('active-plan-depends-on-non-active-parent', conflict_types)
         self.assertIn('non-active-plan-has-execution-successor', conflict_types)
         self.assertTrue(all(item['provenance'] == 'registry-derived' for item in result['conflicts']))
+
+    def test_strict_mainline_conflicts_on_multiple_active_execution_heads_without_authority(self):
+        rows = plan_governance.parse_registry_rows(registry_text([
+            ['a', 'A', 'docs/a.md', 'execution_plan', 'core', 'active', 'not_started', 'false', 'manual', '1.00', '', '', '', '', '', ''],
+            ['b', 'B', 'docs/b.md', 'execution_plan', 'core', 'active', 'not_started', 'false', 'manual', '1.00', '', '', '', '', '', ''],
+        ]))
+
+        result = plan_governance.PlanGraph(rows, {'execution_policy': 'strict_mainline'}).conflicts()
+        conflict_types = {item['type'] for item in result['conflicts']}
+
+        self.assertIn('multiple-active-execution-heads-in-strict-mainline', conflict_types)
 
     def test_integrity_detects_cycle_and_orphan_parent(self):
         rows = plan_governance.parse_registry_rows(registry_text([
@@ -193,6 +290,34 @@ class PlanGraphTests(unittest.TestCase):
             data = json.loads(result.stdout)
             self.assertEqual(data['query'], 'conflicts')
             self.assertEqual(data['conflicts'][0]['type'], 'multiple-active-authoritative-heads')
+
+    def test_cli_graph_context_outputs_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / 'docs'
+            docs.mkdir()
+            rows = [
+                ['roadmap', 'Roadmap', 'docs/roadmap.md', 'master_plan', 'core', 'active', 'in_progress', 'true', 'manual', '1.00', '', '', '', '', '', 'part of current mainline'],
+                ['week1', 'Week 1', 'docs/week1.md', 'execution_plan', 'core', 'active', 'not_started', 'true', 'manual', '1.00', 'roadmap', '', '', '', '', ''],
+                ['decision', 'Decision', 'docs/decision.md', 'decision_doc', 'core', 'active', 'n_a', 'false', 'manual', '1.00', '', '', '', '', '', ''],
+            ]
+            (docs / 'plan_registry.md').write_text(registry_text(rows), encoding='utf-8')
+            (docs / 'roadmap.md').write_text('# Roadmap\n', encoding='utf-8')
+            (docs / 'week1.md').write_text('# Week 1\n\nSee [decision](decision.md).\n', encoding='utf-8')
+            (docs / 'decision.md').write_text('# Decision\n', encoding='utf-8')
+
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), 'graph', 'context', 'week1', '--repo-root', str(root)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            data = json.loads(result.stdout)
+
+            self.assertEqual(data['query'], 'context')
+            self.assertEqual(data['plan']['plan_id'], 'week1')
+            self.assertEqual(data['body_links']['edge_count'], 1)
+            self.assertGreaterEqual(data['must_read_count'], 2)
 
     def test_cli_graph_body_links_resolves_edges_and_unresolved_refs(self):
         with tempfile.TemporaryDirectory() as tmp:

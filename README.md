@@ -43,6 +43,14 @@ PlanGraph turns scattered roadmaps, execution checklists, closeouts, state docs,
 | Current work is mixed with historical closeouts and future drafts | Separates executable mainline, deferred work, superseded docs, closed docs, and governed references |
 | An agent is about to change a plan without historical context | Provides graph queries for lineage, impact, conflicts, and related context |
 
+## How It Works
+
+PlanGraph does not replace your project plans. It makes their lifecycle and relationships explicit, then gives agents compact graph queries before they edit anything.
+
+<p align="center">
+  <img src="./assets/how-it-works.png" alt="How PlanGraph turns scattered plan docs into agent context" width="900" />
+</p>
+
 ## 30-Second Start
 
 ### Option 1: install with `npx skills` (recommended)
@@ -82,21 +90,46 @@ Use $plangraph to enable planning graph.
 | `Use $plangraph to analyze this repo.` | Read-only scan. It writes an adoption report, but does not create a registry or modify `AGENTS.md`. |
 | `Use $plangraph to enable planning graph.` | Creates governance files and installs the managed `AGENTS.md` block unless you explicitly refuse. |
 
+## What Success Looks Like
+
+In the first few minutes, a useful repo should give you three concrete signals:
+
+| Step | You should see |
+|---|---|
+| Analyze | `docs/plan_adoption_report.md` lists candidate plan docs, skipped in-scope files, and out-of-scope Markdown that was not inspected |
+| Enable | `docs/plan_registry.md` separates current plans from closed, superseded, deferred, reference, and evidence docs |
+| Query | `graph mainline` and `graph context <plan_id>` return compact JSON an agent can use before editing plans |
+
+If the adoption report finds no meaningful plan documents, that is also a valid result: the repo probably does not need PlanGraph yet.
+
 ## Current Capabilities
 
 PlanGraph currently focuses on the deterministic foundation:
 
-- brownfield adoption analysis
+- brownfield adoption analysis with scan-scope and out-of-scope Markdown disclosure
 - canonical plan registry
 - lifecycle states for active, deferred, superseded, closed, rejected, archived, and unknown docs
 - `supersedes` / `superseded_by` relationships
 - current mainline separation
 - proactive register / refresh / close / supersede maintenance
 - lint rules for registry and lifecycle consistency
-- in-memory graph queries for mainline, lineage, impact, deterministic conflicts, explicit Markdown body links, and outside-repo external references
+- in-memory graph queries for mainline, lineage, impact, deterministic context, deterministic conflicts, explicit Markdown body links, and outside-repo external references
 - dry-run/apply adoption for useful external Markdown references
+- local SQLite indexing for status, sync, FTS query, and stable read caches
+- a read-only stdio MCP server for status, mainline, query, lineage, impact, context, conflicts, and body-links, plus Codex install/uninstall and workspace-root discovery
+- explicit semantic soft-edge extraction for high-confidence cross-workstream, registry-zero-relation overlaps
 
-SQLite indexing, MCP server support, and semantic edges are planned phases, not required for the current local-first skill workflow. Body-link extraction is available as a read-only graph query. Real-repo validation has shown that outside-repo links should first be classified as external references, not rushed into SQLite.
+SQLite, MCP, and semantic edges are derived layers. The registry remains the source of truth; ordinary `query` stays deterministic text search, and semantic results are exposed only through the explicit `semantic` command.
+
+SQLite query now keeps the fast FTS path for ordinary English phrase search, but it falls back to SQLite `LIKE '%term%'` matching when FTS returns zero rows. This is mainly for short CJK terms and substring-style lookups, so a Chinese user does not read "no result" as "document does not exist."
+
+`impact` and `context` default to compact ranked output so an agent can read the current plan, the most relevant related plans, conflicts, and must-read files without being flooded by every same-workstream historical document. Pass `--mode expanded` on the CLI, or `mode: "expanded"` through MCP, when a caller needs the full related set.
+
+## Release Surface
+
+The supported public surface is the deterministic PlanGraph workflow: adoption scan, bootstrap, registry maintenance, lifecycle lint, and graph queries for mainline, lineage, impact, context, conflicts, body links, and external references.
+
+SQLite, MCP, and semantic soft edges are local experimental product-foundation layers. They are useful for validating a more mature CodeGraph-like experience, but they should not be treated as the stable public API yet. In particular, semantic output is intentionally explicit and sparse: on the real validation repo, filtering reduced 42 raw overlap candidates to 1 registry-zero-relation cross-workstream edge.
 
 ## How It Works After Enablement
 
@@ -130,7 +163,7 @@ This new plan replaces the old Week 2 retrieval plan.
 The agent links the new plan to the old one with `supersedes` / `superseded_by`.
 
 ```text
-Before changing the current plan, check its lineage, impact, and body links.
+Before changing the current plan, check its context, lineage, impact, and body links.
 ```
 
 The agent queries PlanGraph before choosing the source of truth.
@@ -146,6 +179,7 @@ The screenshots below use a small synthetic brownfield repo. They are intentiona
 ### Read-only adoption report
 
 The adoption scan produces a readable report before the repo is governed. It helps a human decide which legacy files are current, historical, weak matches, or candidates for quarantine.
+It also reports how many Markdown files were inside the configured scan scope and how many were outside scope, so users can tell whether PlanGraph inspected the folders they expected.
 
 <p align="center">
   <img src="./assets/screenshot-adoption-report.png" alt="Plan adoption report screenshot" width="900" />
@@ -168,6 +202,37 @@ The timeline report is derived from the registry, so humans and agents can quick
 </p>
 
 Sample Markdown outputs and a GitHub Actions lint template are available in [`examples/`](./examples/).
+
+## MCP In Codex
+
+PlanGraph now has a narrow first-host MCP path for Codex.
+
+Install the local stdio server into Codex:
+
+```bash
+python3 scripts/plan_governance.py install --repo-root "$(pwd)"
+```
+
+Check what Codex will use:
+
+```bash
+python3 scripts/plan_governance.py discover-mcp --repo-root "$(pwd)"
+```
+
+Remove the Codex MCP entry:
+
+```bash
+python3 scripts/plan_governance.py uninstall
+```
+
+This install path is intentionally host-scoped:
+
+- it configures one global `plangraph` MCP entry in Codex instead of one static server per repo
+- the server discovers the active repo from MCP `rootUri` / `workspaceFolders`
+- if the workspace root is a parent folder, the server auto-selects a single nearest governed child repo when exactly one exists
+- MCP tools also accept `projectPath` or `repo_root` when an agent needs to target a specific governed repo explicitly
+- `PLANGRAPH_REPO_ROOT` remains available as a manual override for hosts or scripts that cannot send workspace metadata
+- restart Codex after install or uninstall so the MCP tool list refreshes
 
 ## Boundaries And Exit
 

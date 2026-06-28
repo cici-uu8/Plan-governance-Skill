@@ -15,9 +15,11 @@ The current implementation is deterministic and registry-driven. It uses:
 2. `docs/plan_timeline_report.md` as a derived analytical report.
 3. `docs/plan_adoption_report.md` as a read-only first-pass report for existing repos.
 4. `.plangraph.yml` and `.plangraph.ignore` as the current config files.
-5. in-memory graph queries for mainline, lineage, and impact.
+5. in-memory graph queries for mainline, lineage, impact, context, conflicts, and body links.
+6. optional local SQLite indexing under `.plangraph/plangraph.db` for persisted graph status and MCP reads.
+7. an optional stdio MCP server for read-only status, mainline, query, lineage, impact, context, conflicts, and body-link tools.
 
-SQLite indexing, MCP server support, body-link extraction, and semantic edges are planned phases, not required for the current skill workflow.
+SQLite indexing, MCP reads, and semantic soft edges are derived layers. They do not replace the registry as the source of truth.
 
 After installation, users should normally invoke this skill through natural-language requests in Codex, not by typing script paths manually. The Python commands shown below are implementation details the skill may use when deterministic file updates or graph queries are needed.
 
@@ -94,7 +96,7 @@ The current implementation manages four layers:
 1. `docs/plan_registry.md` is the canonical registry.
 2. `docs/plan_timeline_report.md` is a derived analytical report.
 3. `docs/plan_adoption_report.md` is a read-only first-pass report for existing repos.
-4. graph queries derive mainline, lineage, impact, conflicts, and body links from registry rows and repo files.
+4. graph queries derive mainline, lineage, impact, context, conflicts, and body links from registry rows and repo files.
 
 PlanGraph supports multiple active workstreams. It does not assume there is only one active plan in the whole repo. Instead, it enforces one canonical registry and requires each registered document to declare its role and lifecycle clearly.
 
@@ -138,6 +140,8 @@ The report explains, in plain language:
 - which ones are strong candidates
 - which ones need human review
 - which files were skipped and why
+- how many Markdown files were inside the configured scan scope
+- how many Markdown files were outside scope and not inspected
 - what to do next
 
 ### 1. Enable PlanGraph
@@ -202,16 +206,27 @@ Use graph queries before modifying important plans or when deciding which plan i
 python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph mainline --repo-root "$(pwd)"
 python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph lineage <plan_id> --repo-root "$(pwd)"
 python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph impact <plan_id> --repo-root "$(pwd)"
+python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph context <plan_id> --repo-root "$(pwd)"
 python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph conflicts --repo-root "$(pwd)"
 python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py graph body-links [plan_id] --repo-root "$(pwd)"
 python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py adopt-external-references --repo-root "$(pwd)"
+python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py index --repo-root "$(pwd)"
+python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py status --repo-root "$(pwd)"
+python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py sync --repo-root "$(pwd)"
+python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py query <text> --repo-root "$(pwd)"
+python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py mcp --repo-root "$(pwd)"
+python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py semantic --repo-root "$(pwd)"
 ```
 
 Graph query output is JSON. It is intended for agent consumption, not prose scraping. Treat `registry-direct` and `manual-confirmed` relationships as stronger evidence than inferred or derived relationships.
 
 `graph mainline` includes `derivation`: `manual-pinned` when `mainline_mode=manual` and `mainline_doc_paths` are set, otherwise `auto-derived`. Auto-derived mainline output is a planning signal, not a human-confirmed single source of truth.
 
-`graph conflicts` reports deterministic hard conflicts from registry state only. It does not report semantic or embedding-inferred conflicts.
+`graph impact <plan_id>` and `graph context <plan_id>` default to compact ranked output. Compact mode keeps the selected plan, strong registry relationships, current mainline heads, conflicts, body-linked docs, and the highest-priority same-workstream items while reporting omitted counts. Use `--mode expanded` on the CLI or `mode: "expanded"` through MCP when the full related set is needed.
+
+`graph context <plan_id>` is a deterministic aggregation query. It combines the selected plan, same-workstream mainline view, lineage, impact, plan-specific deterministic conflicts, explicit body links, and a deduplicated `must_read` file list. It does not include semantic soft edges.
+
+`graph conflicts` reports deterministic hard conflicts from registry state only. In `strict_mainline` mode, multiple active `execution_plan` heads in the same workstream are a conflict even when none of them are marked authoritative, because a user or agent must pin, close, or supersede until one current head remains. It does not report semantic or embedding-inferred conflicts.
 
 `graph body-links` extracts explicit Markdown links from registered document bodies. It reports repo-local `body-link` edges, outside-repo `external_reference` items, and unresolved references, but it does not write inferred relationships back to the registry. External references include existence and trust metadata. They stay outside the current repo graph unless a future workflow explicitly adopts them; `external_reference_roots` only marks configured local roots as trusted context.
 
@@ -239,7 +254,23 @@ This checks for:
 
 Outside-repo local Markdown links are reported as `external_reference` context instead of failing lint by default. Missing repo-local links still fail lint because they point at broken or unregistered documents inside the governed repo.
 
-After adopting external references, run `graph body-links` again. If repo-local body-link edges remain sparse or semantically ambiguous, do not move to SQLite indexing yet.
+After adopting external references, run `graph body-links` again. Use `index` to build the local SQLite cache when persisted graph status, future MCP reads, or multi-agent read stability matter. Use `status` to check whether the cache exists and whether it is stale after registry or plan-document changes. Use `sync` to rebuild missing, stale, or old-schema indexes. Use `query` for SQLite-backed text search over indexed plan titles, paths, bodies, and notes. `query` keeps FTS as the primary path and falls back to SQLite `LIKE` only when FTS returns no rows or cannot parse the query, mainly for short CJK terms and substring search.
+
+Use `mcp` only when a host wants a stdio MCP server. The MCP layer exposes read-only status, mainline, query, lineage, impact, context, conflicts, and body-link tools. It does not replace the CLI or registry.
+
+For Codex, PlanGraph now has a narrow first-host install path:
+
+```bash
+python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py install --repo-root "$(pwd)"
+python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py discover-mcp --repo-root "$(pwd)"
+python3 ~/.codex/skills/plan-governance/scripts/plan_governance.py uninstall
+```
+
+This install path is intentionally global-to-Codex rather than per-repo static config. The server should discover the active workspace from MCP `rootUri` / `workspaceFolders`; `PLANGRAPH_REPO_ROOT` remains only as an override when a host cannot send workspace metadata.
+
+When the MCP workspace root is a parent directory, the server may auto-select a single nearest governed child repo if exactly one child contains `.plangraph.yml`, the legacy config, or `docs/plan_registry.md`. It must not guess when several governed child repos are equally near. Read-only MCP tools also accept `projectPath` or `repo_root` so an agent can explicitly target a governed repo, matching CodeGraph-style per-tool project routing.
+
+Use `semantic` only as an explicit advanced operation. It builds `semantic-inferred` soft edges in the local SQLite cache, never writes them to the registry, and never makes them fatal lint errors. Ordinary `query` output must stay deterministic text search and must not include `semantic_results` by default. `semantic` should prioritize high-confidence pairs that have no direct registry hard relation and are not in the same workstream, so it surfaces likely incremental context rather than repeating known hard edges.
 
 ### 5. Close or supersede a plan
 
@@ -299,7 +330,8 @@ This skill manages or generates:
 - `docs/plan_quarantine.md`
 - `.plangraph.yml`
 - `.plangraph.ignore`
-- JSON graph query output for mainline, lineage, impact, conflicts, and body-links
+- `.plangraph/plangraph.db`
+- JSON graph query output for mainline, lineage, impact, context, conflicts, and body-links
 
 ## Common Mistakes
 
