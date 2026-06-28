@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Generate synthetic README assets for the public repository.
 
-This script renders the logo, hero banner, and example screenshots used in
-the repository README files. It reads sample Markdown outputs from
-`examples/` and writes PNG assets into `assets/`.
+This script renders the README diagrams and example screenshots. When
+GPT-generated logo or hero source images are present in `assets/`, it derives
+the public README-sized PNGs from those sources instead of redrawing them.
 """
 
 from __future__ import annotations
@@ -111,6 +111,17 @@ def card_title(draw: ImageDraw.ImageDraw, x: int, y: int, text: str) -> int:
     return y + 42
 
 
+def resize_asset(source_name: str, target_name: str, size: tuple[int, int]) -> bool:
+    source = ASSETS_DIR / source_name
+    if not source.exists():
+        return False
+    with Image.open(source) as img:
+        img = img.convert("RGBA")
+        resized = img.resize(size, Image.Resampling.LANCZOS)
+        resized.save(ASSETS_DIR / target_name)
+    return True
+
+
 def centered_text(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], text: str, *, font_obj: ImageFont.FreeTypeFont, fill: str) -> None:
     left, top, right, bottom = box
     bbox = draw.textbbox((0, 0), text, font=font_obj)
@@ -145,6 +156,8 @@ def draw_graph_node(draw: ImageDraw.ImageDraw, x: int, y: int, r: int, *, fill: 
 
 
 def generate_logo() -> None:
+    if resize_asset("logo-gpt-source.png", "logo.png", (512, 512)):
+        return
     img = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     rounded(draw, (48, 48, 464, 464), fill=BG, radius=84, outline=TEAL_DARK, width=4)
@@ -165,6 +178,8 @@ def generate_logo() -> None:
 
 
 def generate_banner() -> None:
+    if resize_asset("hero-banner-gpt-source.png", "hero-banner.png", (1600, 900)):
+        return
     img = Image.new("RGBA", (1600, 900), BG)
     draw = ImageDraw.Draw(img)
     rounded(draw, (48, 48, 1552, 852), fill=PANEL, radius=40, outline=GRID, width=2)
